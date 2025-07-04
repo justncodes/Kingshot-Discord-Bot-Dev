@@ -66,6 +66,10 @@ if __name__ == "__main__":
         with open("version", "w") as f:
             f.write(current_version)
         
+        # Create a migration flag to indicate we should auto-update after restart
+        with open(".migration_update", "w") as f:
+            f.write("1")
+        
         # Clean up old autoupdateinfo file
         if os.path.exists("autoupdateinfo.txt"):
             try:
@@ -95,7 +99,7 @@ if __name__ == "__main__":
                     response = requests.get(source['api_url'], timeout=30)
                     if response.status_code == 200:
                         data = response.json()
-                        # Use GitHub's automatic source archive
+                        # Using GitHub's automatic source archive
                         repo_name = source['api_url'].split('/repos/')[1].split('/releases')[0]
                         download_url = f"https://github.com/{repo_name}/archive/refs/tags/{data['tag_name']}.zip"
                         return {
@@ -123,10 +127,14 @@ if __name__ == "__main__":
         print("All update sources failed")
         return None
 
-    def restart_bot():
+    def restart_bot(for_update=False):
         print(Fore.YELLOW + "\nRestarting bot..." + Style.RESET_ALL)
         python = sys.executable
-        os.execl(python, python, *sys.argv)
+        if for_update: # Add --autoupdate when restarting for an update
+            args = [python] + sys.argv + ["--autoupdate"]
+        else:
+            args = [python] + sys.argv
+        os.execl(python, *args)
 
     def setup_version_table():
         try:
@@ -156,8 +164,7 @@ if __name__ == "__main__":
 
     async def check_and_update_files():
         """New update system using GitHub releases"""
-        try:
-            # Check if we need to migrate from legacy system
+        try: # Check if we need to migrate from legacy system
             if is_legacy_version():
                 migrate_from_legacy()
 
@@ -179,8 +186,26 @@ if __name__ == "__main__":
                     print(release_info["body"])
                     print()
                     
-                    response = input("Do you want to update now? (y/n): ").lower()
-                    if response == 'y':
+                    # Check for --autoupdate argument, migration flag, or prompt user
+                    update = False
+                    migration_update = os.path.exists(".migration_update")
+                    
+                    if "--autoupdate" in sys.argv:
+                        print(Fore.GREEN + "Auto-update enabled, proceeding with update..." + Style.RESET_ALL)
+                        update = True
+                    elif migration_update:
+                        print(Fore.GREEN + "Migration detected, auto-proceeding with update..." + Style.RESET_ALL)
+                        update = True
+                        try: # Clean up the migration flag
+                            os.remove(".migration_update")
+                        except Exception:
+                            pass
+                    else:
+                        print("Note: You can use the --autoupdate argument to skip this prompt in the future.")
+                        response = input("Do you want to update now? (y/n): ").lower()
+                        update = response == 'y'
+                    
+                    if update:
                         # Backup database if it exists
                         if os.path.exists("db") and os.path.isdir("db"):
                             print(Fore.YELLOW + "Making backup of database..." + Style.RESET_ALL)
@@ -201,7 +226,6 @@ if __name__ == "__main__":
                                                 
                         download_url = release_info["download_url"]
                         print(Fore.YELLOW + f"Downloading update from {source_name}..." + Style.RESET_ALL)
-                        
                         safe_remove_file("package.zip")
                         download_resp = requests.get(download_url, timeout=600)
                         
@@ -312,7 +336,7 @@ if __name__ == "__main__":
                                 f.write(latest_tag)
                             
                             print(Fore.GREEN + f"Update completed successfully from {source_name}." + Style.RESET_ALL)
-                            restart_bot()
+                            restart_bot(for_update=True)
                         else:
                             print(Fore.RED + f"Failed to download the update from {source_name}. HTTP status: {download_resp.status_code}" + Style.RESET_ALL)
                             return  
