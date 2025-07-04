@@ -68,7 +68,7 @@ if __name__ == "__main__":
     # Migration function to detect old system and migrate to new
     def is_legacy_version():
         """Check if this is the old autoupdateinfo.txt based system"""
-        return os.path.exists("autoupdateinfo.txt") or not os.path.exists("version")
+        return os.path.exists("autoupdateinfo.txt") and not os.path.exists("version")
 
     def migrate_from_legacy():
         """Migrate from old system to new GitHub release system"""
@@ -113,7 +113,7 @@ if __name__ == "__main__":
     UPDATE_SOURCES = [
         {
             "name": "GitHub",
-            "api_url": "https://api.github.com/repos/justncodes/Kingshot-Discord-Bot/releases/latest",
+            "api_url": "https://api.github.com/repos/justncodes/Kingshot-Discord-Bot-Dev/releases/latest",
             "primary": True
         }
     ]
