@@ -45,18 +45,17 @@ class GNCommands(commands.Cog):
                     )
 
                     status_embed.add_field(
-                        name="📌 Support Information",
+                        name="📌 Community & Support",
                         value=(
-                            "**Developer:** <@918825495456514088>\n"
-                            "**Discord Server:** [Click to Join](https://discord.gg/whiteoutall)\n"
-                            "**Support:** [Buy me a coffee ☕](https://www.buymeacoffee.com/reloisback)\n"
+                            "**GitHub Repository:** [Kingshot Bot](https://github.com/justncodes/Kingshot-Discord-Bot)\n"
+                            "**Discord Community:** [Join our Discord](https://discord.gg/HFnNnQWnbS)\n"
+                            "**Bug Reports:** [GitHub Issues](https://github.com/justncodes/Kingshot-Discord-Bot/issues)\n"
                             "━━━━━━━━━━━━━━━━━━━━━━"
                         ),
                         inline=False
                     )
 
-                    status_embed.set_thumbnail(url="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png")
-                    status_embed.set_footer(text="Thank you for using our bot! Feel free to contact for support.")
+                    status_embed.set_footer(text="Thanks for using the bot! Maintained with ❤️ by the WOSLand Bot Team.")
 
                     await admin_user.send(embed=status_embed)
 

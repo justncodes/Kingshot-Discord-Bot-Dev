@@ -15,16 +15,16 @@ class Changes(commands.Cog):
         
         self.level_mapping = {
             31: "30-1", 32: "30-2", 33: "30-3", 34: "30-4",
-            35: "FC 1", 36: "FC 1 - 1", 37: "FC 1 - 2", 38: "FC 1 - 3", 39: "FC 1 - 4",
-            40: "FC 2", 41: "FC 2 - 1", 42: "FC 2 - 2", 43: "FC 2 - 3", 44: "FC 2 - 4",
-            45: "FC 3", 46: "FC 3 - 1", 47: "FC 3 - 2", 48: "FC 3 - 3", 49: "FC 3 - 4",
-            50: "FC 4", 51: "FC 4 - 1", 52: "FC 4 - 2", 53: "FC 4 - 3", 54: "FC 4 - 4",
-            55: "FC 5", 56: "FC 5 - 1", 57: "FC 5 - 2", 58: "FC 5 - 3", 59: "FC 5 - 4",
-            60: "FC 6", 61: "FC 6 - 1", 62: "FC 6 - 2", 63: "FC 6 - 3", 64: "FC 6 - 4",
-            65: "FC 7", 66: "FC 7 - 1", 67: "FC 7 - 2", 68: "FC 7 - 3", 69: "FC 7 - 4",
-            70: "FC 8", 71: "FC 8 - 1", 72: "FC 8 - 2", 73: "FC 8 - 3", 74: "FC 8 - 4",
-            75: "FC 9", 76: "FC 9 - 1", 77: "FC 9 - 2", 78: "FC 9 - 3", 79: "FC 9 - 4",
-            80: "FC 10", 81: "FC 10 - 1", 82: "FC 10 - 2", 83: "FC 10 - 3", 84: "FC 10 - 4"
+            35: "TG 1", 36: "TG 1 - 1", 37: "TG 1 - 2", 38: "TG 1 - 3", 39: "TG 1 - 4",
+            40: "TG 2", 41: "TG 2 - 1", 42: "TG 2 - 2", 43: "TG 2 - 3", 44: "TG 2 - 4",
+            45: "TG 3", 46: "TG 3 - 1", 47: "TG 3 - 2", 48: "TG 3 - 3", 49: "TG 3 - 4",
+            50: "TG 4", 51: "TG 4 - 1", 52: "TG 4 - 2", 53: "TG 4 - 3", 54: "TG 4 - 4",
+            55: "TG 5", 56: "TG 5 - 1", 57: "TG 5 - 2", 58: "TG 5 - 3", 59: "TG 5 - 4",
+            60: "TG 6", 61: "TG 6 - 1", 62: "TG 6 - 2", 63: "TG 6 - 3", 64: "TG 6 - 4",
+            65: "TG 7", 66: "TG 7 - 1", 67: "TG 7 - 2", 68: "TG 7 - 3", 69: "TG 7 - 4",
+            70: "TG 8", 71: "TG 8 - 1", 72: "TG 8 - 2", 73: "TG 8 - 3", 74: "TG 8 - 4",
+            75: "TG 9", 76: "TG 9 - 1", 77: "TG 9 - 2", 78: "TG 9 - 3", 79: "TG 9 - 4",
+            80: "TG 10", 81: "TG 10 - 1", 82: "TG 10 - 2", 83: "TG 10 - 3", 84: "TG 10 - 4"
         }
 
     def _create_tables(self):
@@ -52,8 +52,8 @@ class Changes(commands.Cog):
                 description=(
                     "**Available Operations**\n"
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
-                    "🔥 **Furnace Changes**\n"
-                    "└ View furnace level changes\n\n"
+                    "🏰 **Castle Changes**\n"
+                    "└ View castle level changes\n\n"
                     "📝 **Nickname Changes**\n"
                     "└ View nickname history\n"
                     "━━━━━━━━━━━━━━━━━━━━━━"
@@ -160,7 +160,7 @@ class Changes(commands.Cog):
             
             if not changes:
                 await interaction.followup.send(
-                    "No furnace changes found for this player.",
+                    "No castle level changes found for this player.",
                     ephemeral=True
                 )
                 return
@@ -173,7 +173,7 @@ class Changes(commands.Cog):
                 current_level = user_info[1] if user_info else 0
 
             embed = discord.Embed(
-                title=f"🔥 Furnace Level History",
+                title=f"🏰 Castle Level History",
                 description=(
                     f"**Player:** `{nickname}`\n"
                     f"**FID:** `{fid}`\n"
@@ -197,7 +197,7 @@ class Changes(commands.Cog):
         except Exception as e:
             print(f"Error in show_furnace_history: {e}")
             await interaction.followup.send(
-                "❌ An error occurred while displaying the furnace history.",
+                "❌ An error occurred while displaying the castle history.",
                 ephemeral=True
             )
 
@@ -402,8 +402,8 @@ class HistoryView(discord.ui.View):
         self.level_mapping = cog.level_mapping
 
     @discord.ui.button(
-        label="Furnace Changes",
-        emoji="🔥",
+        label="Castle Changes",
+        emoji="🏰",
         style=discord.ButtonStyle.primary,
         custom_id="furnace_changes",
         row=0
@@ -449,9 +449,9 @@ class HistoryView(discord.ui.View):
                 special_alliance_text += "━━━━━━━━━━━━━━━━━━━━━━"
 
             select_embed = discord.Embed(
-                title="🔥 Furnace Changes",
+                title="🏰 Castle Changes",
                 description=(
-                    "Select an alliance to view furnace changes:\n\n"
+                    "Select an alliance to view castle changes:\n\n"
                     "**Permission Details**\n"
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"👤 **Access Level:** `{'Global Admin' if admin_info[1] == 1 else 'Server Admin'}`\n"
@@ -526,7 +526,7 @@ class HistoryView(discord.ui.View):
             embed = discord.Embed(
                 title=f"🔥 {alliance_name} - Member List",
                 description=(
-                    "Select a member to view furnace history:\n"
+                    "Select a member to view castle history:\n"
                     "━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"Total Members: {len(members)}\n"
                     f"Current Page: 1/{view.total_pages}\n"
@@ -764,12 +764,12 @@ class MemberListView(discord.ui.View):
                 print(f"Error in member_callback: {e}")
                 if not interaction.response.is_done():
                     await interaction.response.send_message(
-                        "❌ An error occurred while showing furnace history.",
+                        "❌ An error occurred while showing castle history.",
                         ephemeral=True
                     )
                 else:
                     await interaction.followup.send(
-                        "❌ An error occurred while showing furnace history.",
+                        "❌ An error occurred while showing castle history.",
                         ephemeral=True
                     )
 
@@ -902,9 +902,9 @@ class MemberListView(discord.ui.View):
         self.update_view()
         
         embed = discord.Embed(
-            title=f"🔥 {self.alliance_name} - Member List",
+            title=f"🏰 {self.alliance_name} - Member List",
             description=(
-                "Select a member to view furnace history:\n"
+                "Select a member to view castle history:\n"
                 "━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Total Members: {len(self.members)}\n"
                 f"Current Page: {self.current_page + 1}/{self.total_pages}\n"
@@ -1202,7 +1202,8 @@ class CustomTimeModal(discord.ui.Modal, title="Custom Time Range"):
                 )
                 return
             
-            await self.cog.show_recent_nickname_changes(interaction, self.alliance_name, hours)
+            await interaction.response.defer()
+            await self.cog.show_recent_changes(interaction, self.alliance_name, hours)
                 
         except ValueError:
             await interaction.response.send_message(

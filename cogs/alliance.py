@@ -42,6 +42,10 @@ class Alliance(commands.Cog):
 
     async def view_alliances(self, interaction: discord.Interaction):
         
+        if interaction.guild is None:
+            await interaction.response.send_message("❌ This command must be used in a server, not in DMs.", ephemeral=True)
+            return
+
         user_id = interaction.user.id
         self.c_settings.execute("SELECT id, is_initial FROM admin WHERE id = ?", (user_id,))
         admin = self.c_settings.fetchone()
@@ -110,6 +114,16 @@ class Alliance(commands.Cog):
     @app_commands.command(name="settings", description="Open settings menu.")
     async def settings(self, interaction: discord.Interaction):
         try:
+            if interaction.guild is not None: # Check bot permissions only if in a guild
+                perm_check = interaction.guild.get_member(interaction.client.user.id)
+                if not perm_check.guild_permissions.administrator:
+                    await interaction.response.send_message(
+                        "Beeb boop 🤖 I need **Administrator** permissions to function. "
+                        "Go to server settings --> Roles --> find my role --> scroll down and turn on Administrator", 
+                        ephemeral=True
+                    )
+                    return
+                
             self.c_settings.execute("SELECT COUNT(*) FROM admin")
             admin_count = self.c_settings.fetchone()[0]
 
@@ -380,7 +394,9 @@ class Alliance(commands.Cog):
                                     color=discord.Color.blue()
                                 )
                                 await select_interaction.response.send_message(embed=progress_embed)
-                                
+                                msg = await select_interaction.original_response()
+                                message_id = msg.id
+
                                 for index, (alliance_id, name, _) in enumerate(alliances):
                                     try:
                                         queue_status_embed = discord.Embed(
@@ -398,8 +414,10 @@ class Alliance(commands.Cog):
                                             ),
                                             color=discord.Color.blue()
                                         )
+                                        channel = select_interaction.channel
+                                        msg = await channel.fetch_message(message_id)
                                         await select_interaction.edit_original_response(embed=queue_status_embed)
-                                        
+
                                         self.c.execute("""
                                             SELECT channel_id FROM alliancesettings WHERE alliance_id = ?
                                         """, (alliance_id,))
@@ -435,7 +453,9 @@ class Alliance(commands.Cog):
                                     ),
                                     color=discord.Color.green()
                                 )
-                                await select_interaction.edit_original_response(embed=queue_complete_embed)
+                                channel = select_interaction.channel
+                                msg = await channel.fetch_message(message_id)
+                                await msg.edit(embed=queue_complete_embed)
                             
                             else:
                                 alliance_id = int(selected_value)

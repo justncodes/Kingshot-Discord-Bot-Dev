@@ -6,8 +6,8 @@ import pytz
 import os
 import asyncio
 import json
-import urllib.parse
 import traceback
+import time
 
 class BearTrap(commands.Cog):
     def __init__(self, bot):
@@ -17,6 +17,10 @@ class BearTrap(commands.Cog):
         os.makedirs('db', exist_ok=True)
         self.conn = sqlite3.connect(self.db_path)
         self.cursor = self.conn.cursor()
+
+        # Rate limiting for channel unavailable warnings
+        self.channel_warning_timestamps = {}
+        self.channel_warning_interval = 300
 
         self.cursor.execute("""
             CREATE TABLE IF NOT EXISTS bear_notifications (
@@ -66,11 +70,19 @@ class BearTrap(commands.Cog):
             )
         """)
 
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS notification_days (
+                notification_id INTEGER,
+                weekday TEXT,
+                FOREIGN KEY (notification_id) REFERENCES bear_notifications(id) ON DELETE CASCADE
+            )
+        """)
+
         try:
             self.cursor.execute("SELECT mention_message FROM bear_notification_embeds LIMIT 1")
         except sqlite3.OperationalError:
             self.cursor.execute("ALTER TABLE bear_notification_embeds ADD COLUMN mention_message TEXT")
-        
+
         self.conn.commit()
 
     async def cog_load(self):
@@ -82,10 +94,21 @@ class BearTrap(commands.Cog):
         if hasattr(self, 'notification_task'):
             self.notification_task.cancel()
 
+    def should_warn_about_channel(self, channel_id: int) -> bool:
+        """Check if we should warn about this channel being unavailable."""
+        current_time = time.time()
+        last_warning = self.channel_warning_timestamps.get(channel_id, 0)
+        
+        if current_time - last_warning >= self.channel_warning_interval:
+            self.channel_warning_timestamps[channel_id] = current_time
+            return True
+        return False
+
     async def save_notification(self, guild_id: int, channel_id: int, start_date: datetime,
-                              hour: int, minute: int, timezone: str, description: str,
-                              created_by: int, notification_type: int, mention_type: str,
-                              repeat_48h: bool, repeat_minutes: int = 0) -> int:
+                                hour: int, minute: int, timezone: str, description: str,
+                                created_by: int, notification_type: int, mention_type: str,
+                                repeat_48h: bool, repeat_minutes: int = 0,
+                                selected_weekdays: list[int] = None) -> int:
         try:
             embed_data = None
             notification_description = description
@@ -93,14 +116,15 @@ class BearTrap(commands.Cog):
             if description.startswith("CUSTOM_TIMES:"):
                 parts = description.split("|", 1)
                 notification_description = description
-                
+
                 if len(parts) > 1 and "EMBED_MESSAGE:" in parts[1]:
                     if hasattr(self, 'current_embed_data'):
                         embed_data = self.current_embed_data
             elif "EMBED_MESSAGE:" in description:
-                notification_description = "EMBED_MESSAGE:true"
                 if hasattr(self, 'current_embed_data'):
                     embed_data = self.current_embed_data
+                    title = embed_data.get("title", "true")
+                    notification_description = f"EMBED_MESSAGE:{title}"
 
             tz = pytz.timezone(timezone)
             next_notification = start_date.replace(
@@ -119,11 +143,13 @@ class BearTrap(commands.Cog):
             """, (guild_id, channel_id, hour, minute, timezone, notification_description, notification_type,
                   mention_type, 1 if repeat_48h else 0, repeat_minutes, created_by,
                   next_notification.isoformat()))
-            
+
             notification_id = self.cursor.lastrowid
 
             if embed_data:
                 await self.save_notification_embed(notification_id, embed_data)
+            if repeat_minutes == "fixed":
+                await self.save_notification_fixed(notification_id, selected_weekdays)
 
             self.conn.commit()
             return notification_id
@@ -154,6 +180,24 @@ class BearTrap(commands.Cog):
             print(f"Error saving embed: {e}")
             return False
 
+    async def save_notification_fixed(self, notification_id: int, weekdays: list[int]):
+        try:
+            if not weekdays:
+                raise ValueError("Weekdays list is empty")
+
+            sorted_days = sorted(weekdays)
+            weekday = "|".join(str(d) for d in sorted_days)
+
+            self.cursor.execute("""
+                INSERT INTO notification_days (notification_id, weekday)
+                VALUES (?, ?)
+            """, (notification_id, weekday))
+
+            self.conn.commit()
+        except Exception as e:
+            print(f"Error saving fixed weekdays: {e}")
+            raise
+
     async def get_notification_embed(self, notification_id: int) -> dict:
         try:
             self.cursor.execute("""
@@ -161,7 +205,7 @@ class BearTrap(commands.Cog):
                 FROM bear_notification_embeds 
                 WHERE notification_id = ?
             """, (notification_id,))
-            
+
             result = self.cursor.fetchone()
             if result:
                 return {
@@ -209,29 +253,60 @@ class BearTrap(commands.Cog):
              notification_type, mention_type, repeat_enabled, repeat_minutes,
              is_enabled, created_at, created_by, last_notification,
              next_notification) = notification
-            
+
+            weekly_repeat_days = []
+            if repeat_enabled and repeat_minutes == 0:
+                self.cursor.execute("SELECT weekday FROM notification_days WHERE notification_id = ?", (id,))
+                weekly_repeat_days = [row[0] for row in self.cursor.fetchall()]
+
+
             if not is_enabled:
                 return
 
             channel = self.bot.get_channel(channel_id)
             if not channel:
-                self.cursor.execute("""
-                    UPDATE bear_notifications 
-                    SET is_enabled = 0 
-                    WHERE id = ?
-                """, (id,))
-                self.conn.commit()
+                if self.should_warn_about_channel(channel_id):
+                    print(f"Warning: Channel {channel_id} not found for notification {id}.")
                 return
 
             tz = pytz.timezone(timezone)
             now = datetime.now(tz)
             next_time = datetime.fromisoformat(next_notification)
 
-            if next_time < now and repeat_enabled and repeat_minutes > 0:
-                time_diff = (now - next_time).total_seconds() / 60
-                periods_passed = int(time_diff / repeat_minutes) + 1
-                next_time = next_time + timedelta(minutes=repeat_minutes * periods_passed)
-                
+            if next_time < now:
+                if repeat_enabled:
+                    if isinstance(repeat_minutes, int) and repeat_minutes > 0:
+                        # Handle repeated notifications: Move next_time forward by missed intervals
+                        time_diff = (now - next_time).total_seconds() / 60
+                        periods_passed = int(time_diff / repeat_minutes) + 1
+                        next_time = next_time + timedelta(minutes=repeat_minutes * periods_passed)
+
+                    elif repeat_minutes == "fixed":
+                        self.cursor.execute("""
+                                    SELECT weekday FROM notification_days
+                                    WHERE notification_id = ?
+                                """, (id,))
+                        rows = self.cursor.fetchall()
+                        notification_days = set()
+
+                        for row in rows:
+                            parts = row[0].split('|')
+                            notification_days.update(int(p) for p in parts)
+
+                        for next_day in range(1, 8):
+                            potential_day = now + timedelta(days=next_day)
+                            if potential_day.weekday() in notification_days:
+                                next_time = potential_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                                break
+
+                elif repeat_minutes == 0:
+                    # Handle non-repeating notifications: Keep time, but set date to today
+                    next_time = next_time.replace(year=now.year, month=now.month, day=now.day)
+
+                    # If the updated time is still in the past, move it to tomorrow
+                    if next_time < now:
+                        next_time = next_time + timedelta(days=1)
+
                 self.cursor.execute("""
                     UPDATE bear_notifications 
                     SET next_notification = ? 
@@ -247,18 +322,18 @@ class BearTrap(commands.Cog):
                 return
 
             notification_times = []
-            
-            if notification_type == 1:  
+
+            if notification_type == 1:
                 notification_times = [30, 10, 5, 0]
-            elif notification_type == 2:  
+            elif notification_type == 2:
                 notification_times = [10, 5, 0]
-            elif notification_type == 3:  
+            elif notification_type == 3:
                 notification_times = [5, 0]
-            elif notification_type == 4:  
+            elif notification_type == 4:
                 notification_times = [5]
-            elif notification_type == 5:  
+            elif notification_type == 5:
                 notification_times = [0]
-            elif notification_type == 6:  
+            elif notification_type == 6:
                 if description.startswith("CUSTOM_TIMES:"):
                     times_str = description.split("CUSTOM_TIMES:")[1].split("|")[0]
                     if ',' in times_str:
@@ -272,18 +347,18 @@ class BearTrap(commands.Cog):
 
             for notify_time in notification_times:
                 time_diff = abs(minutes_until - notify_time)
-                if time_diff < 0.1:  
+                if time_diff < 0.1:
                     thirty_seconds_ago = (now - timedelta(seconds=30)).strftime('%Y-%m-%d %H:%M:%S')
-                    
+
                     self.cursor.execute("""
                         SELECT COUNT(*) FROM notification_history 
                         WHERE notification_id = ? 
                         AND notification_time = ? 
                         AND sent_at >= ?
                     """, (id, notify_time, thirty_seconds_ago))
-                    
+
                     count = self.cursor.fetchone()[0]
-                    if count == 0:  
+                    if count == 0:
                         should_notify = True
                         current_time = notify_time
                     break
@@ -308,7 +383,7 @@ class BearTrap(commands.Cog):
                         mention_text = f"Member {member_id}"
 
                 rounded_time = round(minutes_until)
-                
+
                 if rounded_time == 1:
                     time_unit = "minute"
                 elif rounded_time < 60:
@@ -331,11 +406,11 @@ class BearTrap(commands.Cog):
                 if "EMBED_MESSAGE:" in description:
                     try:
                         embed_data = await self.get_notification_embed(id)
-                        
+
                         if embed_data:
                             try:
                                 embed = discord.Embed()
-                                
+
                                 try:
                                     color_value = embed_data.get("color")
                                     if color_value is not None:
@@ -362,11 +437,15 @@ class BearTrap(commands.Cog):
                                     embed.description = description
 
                                 image_url = embed_data.get("image_url", "")
-                                if image_url and isinstance(image_url, str) and image_url.strip() and image_url.startswith(('http://', 'https://')):
+                                if image_url and isinstance(image_url,
+                                                            str) and image_url.strip() and image_url.startswith(
+                                        ('http://', 'https://')):
                                     embed.set_image(url=image_url)
 
                                 thumbnail_url = embed_data.get("thumbnail_url", "")
-                                if thumbnail_url and isinstance(thumbnail_url, str) and thumbnail_url.strip() and thumbnail_url.startswith(('http://', 'https://')):
+                                if thumbnail_url and isinstance(thumbnail_url,
+                                                                str) and thumbnail_url.strip() and thumbnail_url.startswith(
+                                        ('http://', 'https://')):
                                     embed.set_thumbnail(url=thumbnail_url)
 
                                 footer_text = embed_data.get("footer", "")
@@ -400,19 +479,22 @@ class BearTrap(commands.Cog):
                                     await channel.send(embed=embed)
                                 else:
                                     if rounded_time > 0:
-                                        await channel.send(f"{mention_text} ⏰ **Notification** will start in **{time_text}**!")
+                                        await channel.send(
+                                            f"{mention_text} ⏰ **Notification** will start in **{time_text}**!")
                                     else:
                                         await channel.send(f"{mention_text} ⏰ **Notification**")
                             except Exception as e:
                                 print(f"Error creating embed: {e}")
                                 if rounded_time > 0:
-                                    await channel.send(f"{mention_text} ⏰ **Error sending embed notification** will start in **{time_text}**!")
+                                    await channel.send(
+                                        f"{mention_text} ⏰ **Error sending embed notification** will start in **{time_text}**!")
                                 else:
                                     await channel.send(f"{mention_text} ⏰ **Error sending embed notification**")
                     except Exception as e:
                         print(f"Error creating embed: {e}")
                         if rounded_time > 0:
-                            await channel.send(f"{mention_text} ⏰ **Error sending embed notification** will start in **{time_text}**!")
+                            await channel.send(
+                                f"{mention_text} ⏰ **Error sending embed notification** will start in **{time_text}**!")
                         else:
                             await channel.send(f"{mention_text} ⏰ **Error sending embed notification**")
                 else:
@@ -436,7 +518,8 @@ class BearTrap(commands.Cog):
                         await channel.send(message)
                     else:
                         if rounded_time > 0:
-                            await channel.send(f"{mention_text} ⏰ **{actual_description}** will start in **{time_text}**!")
+                            await channel.send(
+                                f"{mention_text} ⏰ **{actual_description}** will start in **{time_text}**!")
                         else:
                             await channel.send(f"{mention_text} ⏰ **{actual_description}**")
 
@@ -452,10 +535,37 @@ class BearTrap(commands.Cog):
                     WHERE id = ?
                 """, (now.isoformat(), id))
 
+                if not repeat_enabled and current_time == min(notification_times):
+                    print(f"Warning: (current_time: {current_time}) repeat isnt enabled and last notification was sent for notification {id} at {notification_times}. Disabling the notification")
+                    self.cursor.execute("""
+                        UPDATE bear_notifications 
+                        SET is_enabled = 0 
+                        WHERE id = ?
+                    """, (id,))
+
                 if rounded_time == 0:
-                    if repeat_enabled and repeat_minutes > 0:
-                        current_next = datetime.fromisoformat(next_notification)
-                        next_time = current_next + timedelta(minutes=repeat_minutes)
+                    if repeat_enabled:
+                        if isinstance(repeat_minutes, int) and repeat_minutes > 0:
+                            current_next = datetime.fromisoformat(next_notification)
+                            next_time = current_next + timedelta(minutes=repeat_minutes)
+
+                        elif repeat_minutes == "fixed":
+                            self.cursor.execute("""
+                                        SELECT weekday FROM notification_days
+                                        WHERE notification_id = ?
+                                    """, (id,))
+                            rows = self.cursor.fetchall()
+                            notification_days = set()
+
+                            for row in rows:
+                                parts = row[0].split('|')
+                                notification_days.update(int(p) for p in parts)
+
+                            for next_day in range(1, 8):
+                                potential_day = now + timedelta(days=next_day)
+                                if potential_day.weekday() in notification_days:
+                                    next_time = potential_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                                    break
 
                         self.cursor.execute("""
                             UPDATE bear_notifications 
@@ -463,6 +573,7 @@ class BearTrap(commands.Cog):
                             WHERE id = ?
                         """, (next_time.isoformat(), id))
                     else:
+                        print(f"Warning: (current_time: {current_time}) repeat isnt enabled (repeat = {repeat_enabled}) or repeat minutes arent > 0 (repeat minutes = {repeat_minutes}) for notification {id}. Disabling notification")
                         self.cursor.execute("""
                             UPDATE bear_notifications 
                             SET is_enabled = 0 
@@ -472,21 +583,41 @@ class BearTrap(commands.Cog):
                 self.conn.commit()
                 
         except Exception as e:
-            print(f"Error processing notification: {e}")
-            import traceback
-            traceback.print_exc()
+            error_msg = f"[ERROR] Error processing notification {id}: {str(e)}\nType: {type(e)}\nTrace: {traceback.format_exc()}"
+            print(error_msg)
 
     async def get_notifications(self, guild_id: int) -> list:
         try:
             self.cursor.execute("""
                 SELECT * FROM bear_notifications 
                 WHERE guild_id = ? 
-                ORDER BY next_notification
+                ORDER BY 
+                    CASE 
+                        WHEN next_notification >= CURRENT_TIMESTAMP THEN 0 
+                        ELSE 1 
+                    END,
+                    next_notification
             """, (guild_id,))
             return self.cursor.fetchall()
         except Exception as e:
             print(f"Error getting notifications: {e}")
             return []
+
+    async def delete_notification(self, notification_id):
+        try:
+            # Ensure we're using the same connection as toggle_notification
+            self.cursor.execute("""SELECT id FROM bear_notifications WHERE id = ?""", (notification_id,))
+            result = self.cursor.fetchone()
+            if not result:
+                return False  # If the notification doesn't exist, return False
+
+            # If the notification exists, proceed to delete
+            self.cursor.execute("""DELETE FROM bear_notifications WHERE id = ?""", (notification_id,))
+            self.conn.commit()  # Commit the changes using the same connection as toggle_notification
+            return True
+        except Exception as e:
+            print(f"[ERROR] Error deleting notification {notification_id}: {e}")
+            return False
 
     async def toggle_notification(self, notification_id: int, enabled: bool) -> bool:
         try:
@@ -529,7 +660,7 @@ class BearTrap(commands.Cog):
             ])
             
             embed = discord.Embed(
-                title="🐻 Bear Trap System",
+                title="🔔 Notification System",
                 description=(
                     "Configure time notification settings:\n\n"
                     "**Current World Times**\n"
@@ -540,14 +671,10 @@ class BearTrap(commands.Cog):
                     "⏰ **Set Time**\n"
                     "└ Configure notification time\n"
                     "└ Not just for Bear! Use it for any event:\n"
-                    "   Bear - KE - Forst - CJ and everything else\n"
+                    "   Vikings - KE - Eternity's Reach and everything else\n"
                     "└ Add unlimited notifications\n\n"
-                    "🗑️ **Remove Notification**\n"
-                    "└ Delete unwanted notifications\n\n"
-                    "✅ **Enable/Disable**\n"
-                    "└ Toggle notifications\n\n"
-                    "📋 **View Settings**\n"
-                    "└ Check current configuration\n\n"
+                    "📋 **Manage notification**\n"
+                    "└ Edit, Enable/disable, see a preview, and delete\n\n"
                     "━━━━━━━━━━━━━━━━━━━━━━"
                 ),
                 color=discord.Color.gold()
@@ -580,14 +707,16 @@ class BearTrap(commands.Cog):
             conn.close()
             
             if not is_admin:
-                await interaction.response.send_message("❌ You don't have permission to use this command!", ephemeral=True)
+                await interaction.response.send_message("❌ You don't have permission to use this command!",
+                                                        ephemeral=True)
                 return False
             return True
         except Exception as e:
             print(f"Error in admin check: {e}")
             return False
 
-    async def show_channel_selection(self, interaction: discord.Interaction, start_date, hour, minute, timezone, message_data, channels):
+    async def show_channel_selection(self, interaction: discord.Interaction, start_date, hour, minute, timezone,
+                                     message_data, channels):
         try:
             embed = discord.Embed(
                 title="📢 Select Channel",
@@ -622,230 +751,9 @@ class BearTrap(commands.Cog):
                 ephemeral=True
             )
 
-class SearchableSelectView(discord.ui.View):
-    def __init__(self, options, placeholder="Select an option", min_values=1, max_values=1):
-        super().__init__()
-        self.all_options = options
-        self.current_filter = ""
-        self.page = 0
-        self.filtered_options = options
-        
-        display_options = options[:25]
-        self.select = discord.ui.Select(
-            placeholder=placeholder,
-            min_values=min_values,
-            max_values=max_values,
-            options=display_options
-        )
-        self.add_item(self.select)
-        
-        self.setup_buttons()
-        
-    def setup_buttons(self):
-        self.search_button = discord.ui.Button(
-            style=discord.ButtonStyle.primary,
-            label="Search",
-            emoji="🔍",
-            row=1
-        )
-        self.search_button.callback = self.search_callback
-        self.add_item(self.search_button)
-        
-        if len(self.all_options) > 25:
-            self.prev_button = discord.ui.Button(
-                style=discord.ButtonStyle.secondary,
-                label="Previous",
-                emoji="⬅️",
-                disabled=True,
-                row=2
-            )
-            self.prev_button.callback = self.prev_callback
-            self.add_item(self.prev_button)
-            
-            self.next_button = discord.ui.Button(
-                style=discord.ButtonStyle.secondary,
-                label="Next",
-                emoji="➡️",
-                disabled=len(self.all_options) <= 25,
-                row=2
-            )
-            self.next_button.callback = self.next_callback
-            self.add_item(self.next_button)
-        
-        self.reset_button = discord.ui.Button(
-            style=discord.ButtonStyle.danger,
-            label="Reset Filter",
-            emoji="🔄",
-            row=1,
-            disabled=True
-        )
-        self.reset_button.callback = self.reset_callback
-        self.add_item(self.reset_button)
-    
-    async def search_callback(self, interaction):
-        modal = discord.ui.Modal(title="Search Notifications")
-        search_input = discord.ui.TextInput(
-            label="Search Term",
-            placeholder="Enter text to search for...",
-            default=self.current_filter
-        )
-        modal.add_item(search_input)
-        
-        async def on_modal_submit(modal_interaction):
-            search_term = search_input.value
-            self.current_filter = search_term
-            
-            if search_term:
-                self.filtered_options = [
-                    opt for opt in self.all_options
-                    if search_term.lower() in opt.label.lower() or 
-                    (opt.description and search_term.lower() in opt.description.lower())
-                ]
-            else:
-                self.filtered_options = self.all_options
-            
-            if search_term and not self.filtered_options:
-                no_results_view = discord.ui.View()
-                
-                reset_button = discord.ui.Button(
-                    style=discord.ButtonStyle.primary,
-                    label="Reset Filter",
-                    emoji="🔄",
-                    row=0
-                )
-                
-                async def reset_callback(reset_interaction):
-                    new_view = SearchableSelectView(
-                        self.all_options, 
-                        self.select.placeholder
-                    )
-                    new_view.all_options = self.all_options
-                    
-                    if hasattr(self, 'select') and hasattr(self.select, 'callback'):
-                        new_view.select.callback = self.select.callback
-                    
-                    await reset_interaction.response.edit_message(
-                        content="Select a notification:",
-                        view=new_view
-                    )
-                
-                reset_button.callback = reset_callback
-                no_results_view.add_item(reset_button)
-                
-                await modal_interaction.response.edit_message(
-                    content=f"❌ No results found for '{search_term}'. Please try again.",
-                    view=no_results_view
-                )
-                return
-            
-            self.page = 0
-            
-            new_view = SearchableSelectView(self.filtered_options, self.select.placeholder)
-            new_view.all_options = self.all_options
-            new_view.current_filter = search_term
-            
-            if hasattr(self, 'select') and hasattr(self.select, 'callback'):
-                new_view.select.callback = self.select.callback
-            
-            new_view.reset_button.disabled = not search_term
-            
-            total_pages = max(1, (len(new_view.filtered_options) + 24) // 25)
-            status_text = f"Filter: {search_term}" if search_term else ""
-            status_text += f" | {len(new_view.filtered_options)} results found" if search_term else ""
-            status_text += f" | Page 1/{total_pages}"
-            
-            await modal_interaction.response.edit_message(
-                content=f"Search results: {status_text}" if search_term else "Select a notification:",
-                view=new_view
-            )
-        
-        modal.on_submit = on_modal_submit
-        await interaction.response.send_modal(modal)
-        
-    async def prev_callback(self, interaction):
-        if self.page > 0:
-            self.page -= 1
-            
-            new_view = SearchableSelectView(
-                self.filtered_options, 
-                self.select.placeholder
-            )
-            new_view.all_options = self.all_options
-            new_view.filtered_options = self.filtered_options
-            new_view.current_filter = self.current_filter
-            new_view.page = self.page
-            
-            start_idx = new_view.page * 25
-            new_view.select.options = new_view.filtered_options[start_idx:start_idx+25]
-            
-            if hasattr(self, 'select') and hasattr(self.select, 'callback'):
-                new_view.select.callback = self.select.callback
-            
-            new_view.prev_button.disabled = new_view.page == 0
-            max_page = (len(new_view.filtered_options) - 1) // 25
-            new_view.next_button.disabled = new_view.page >= max_page
-            new_view.reset_button.disabled = not new_view.current_filter
-            
-            total_pages = max(1, (len(new_view.filtered_options) + 24) // 25)
-            status_text = f"Filter: {new_view.current_filter}" if new_view.current_filter else ""
-            status_text += f" | Page {new_view.page+1}/{total_pages}"
-            
-            await interaction.response.edit_message(
-                content=f"Search results: {status_text}" if new_view.current_filter else "Select a notification:",
-                view=new_view
-            )
-            
-    async def next_callback(self, interaction):
-        max_page = (len(self.filtered_options) - 1) // 25
-        if self.page < max_page:
-            self.page += 1
-            
-            new_view = SearchableSelectView(
-                self.filtered_options, 
-                self.select.placeholder
-            )
-            new_view.all_options = self.all_options
-            new_view.filtered_options = self.filtered_options
-            new_view.current_filter = self.current_filter
-            new_view.page = self.page
-            
-            start_idx = new_view.page * 25
-            new_view.select.options = new_view.filtered_options[start_idx:start_idx+25]
-            
-            if hasattr(self, 'select') and hasattr(self.select, 'callback'):
-                new_view.select.callback = self.select.callback
-            
-            new_view.prev_button.disabled = False
-            max_page = (len(new_view.filtered_options) - 1) // 25
-            new_view.next_button.disabled = new_view.page >= max_page
-            new_view.reset_button.disabled = not new_view.current_filter
-            
-            total_pages = max(1, (len(new_view.filtered_options) + 24) // 25)
-            status_text = f"Filter: {new_view.current_filter}" if new_view.current_filter else ""
-            status_text += f" | Page {new_view.page+1}/{total_pages}"
-            
-            await interaction.response.edit_message(
-                content=f"Search results: {status_text}" if new_view.current_filter else "Select a notification:",
-                view=new_view
-            )
-            
-    async def reset_callback(self, interaction):
-        new_view = SearchableSelectView(
-            self.all_options, 
-            self.select.placeholder
-        )
-        new_view.all_options = self.all_options
-        
-        if hasattr(self, 'select') and hasattr(self.select, 'callback'):
-            new_view.select.callback = self.select.callback
-        
-        await interaction.response.edit_message(
-            content="Select a notification:",
-            view=new_view
-        )
-
 class RepeatOptionView(discord.ui.View):
-    def __init__(self, cog, start_date, hour, minute, timezone, description, channel_id, notification_type, mention_type, original_message):
+    def __init__(self, cog, start_date, hour, minute, timezone, description, channel_id, notification_type,
+                 mention_type, original_message):
         super().__init__(timeout=300)
         self.cog = cog
         self.start_date = start_date
@@ -867,7 +775,12 @@ class RepeatOptionView(discord.ui.View):
         modal = RepeatIntervalModal(self)
         await interaction.response.send_modal(modal)
 
-    async def save_notification(self, interaction, repeat, repeat_minutes=0, interval_text=None):
+    @discord.ui.button(label="Specific days", style=discord.ButtonStyle.primary, custom_id="fixed_days")
+    async def fixed_days_button(self, interaction, button):
+        view = DaysMenu(self)
+        await interaction.response.edit_message(content="🗓️ Select the days you'd like to get notifications on:", view=view)
+
+    async def save_notification(self, interaction, repeat, repeat_minutes=0, interval_text=None, selected_weekdays=None):
         try:
             notification_id = await self.cog.save_notification(
                 guild_id=interaction.guild_id,
@@ -881,7 +794,8 @@ class RepeatOptionView(discord.ui.View):
                 notification_type=self.notification_type,
                 mention_type=self.mention_type,
                 repeat_48h=repeat,
-                repeat_minutes=repeat_minutes
+                repeat_minutes=repeat_minutes,
+                selected_weekdays=selected_weekdays
             )
 
             notification_types = {
@@ -1065,6 +979,65 @@ class RepeatIntervalModal(discord.ui.Modal):
                 ephemeral=True
             )
 
+class DaysMenu(discord.ui.View):
+    def __init__(self, repeat_view):
+        super().__init__(timeout=300)
+        self.repeat_view = repeat_view
+        self.selected_days = []
+
+        self.day_select = discord.ui.Select(
+            placeholder="Select days of the week",
+            min_values=1,
+            max_values=7,
+            options=[
+                discord.SelectOption(label="Monday", value="Monday"),
+                discord.SelectOption(label="Tuesday", value="Tuesday"),
+                discord.SelectOption(label="Wednesday", value="Wednesday"),
+                discord.SelectOption(label="Thursday", value="Thursday"),
+                discord.SelectOption(label="Friday", value="Friday"),
+                discord.SelectOption(label="Saturday", value="Saturday"),
+                discord.SelectOption(label="Sunday", value="Sunday"),
+            ],
+            custom_id="days_of_week_select"
+        )
+        self.day_select.callback = self.on_select
+        self.add_item(self.day_select)
+
+        self.add_item(ConfirmDaysButton(self))
+
+    async def on_select(self, interaction: discord.Interaction):
+        self.selected_days = self.day_select.values
+        await interaction.response.defer()
+
+class ConfirmDaysButton(discord.ui.Button):
+    def __init__(self, days_menu_view):
+        super().__init__(label="Confirm", style=discord.ButtonStyle.success)
+        self.days_menu_view = days_menu_view
+
+    async def callback(self, interaction: discord.Interaction):
+        days = self.days_menu_view.selected_days
+        if not days:
+            await interaction.response.send_message("Please select at least one day.", ephemeral=True)
+            return
+
+        weekdays_index = {
+            "Monday": 0, "Tuesday": 1, "Wednesday": 2,
+            "Thursday": 3, "Friday": 4, "Saturday": 5, "Sunday": 6
+        }
+        selected_weekdays = [weekdays_index[d] for d in days]
+
+        repeat_view = self.days_menu_view.repeat_view
+
+        interval_text = "" + ", ".join(days[:-1]) + " and " + days[-1]
+
+        await repeat_view.save_notification(
+            interaction,
+            repeat=True,
+            repeat_minutes="fixed",
+            interval_text=interval_text,
+            selected_weekdays=selected_weekdays
+        )
+
 class TextInputModal(discord.ui.Modal):
     def __init__(self, title, label, placeholder, default_value="", max_length=None, style=discord.TextStyle.short):
         super().__init__(title=title)
@@ -1095,7 +1068,7 @@ class EmbedEditorView(discord.ui.View):
             "title": "⏰ Bear Trap",
             "description": "Add a description...",
             "color": discord.Color.blue().value,
-            "footer": "Bear Trap Notification System",
+            "footer": "Notification System",
             "author": "Bear Trap",
             "mention_message": ""
         }
@@ -1136,14 +1109,15 @@ class EmbedEditorView(discord.ui.View):
                 "• Time will automatically show with appropriate units (minutes/hours/days)\n\n"
                 f"Currently showing '{example_time}' as an example.\n\n"
                 f"**Current Mention Message Preview:**\n"
-                f"{mention_preview}\n\n"               
+                f"{mention_preview}\n\n"
             )
 
             if not interaction.response.is_done():
                 await interaction.response.edit_message(content=content, embed=embed, view=self)
             else:
-                await interaction.followup.edit_message(message_id=interaction.message.id, content=content, embed=embed, view=self)
-            
+                await interaction.followup.edit_message(message_id=interaction.message.id, content=content, embed=embed,
+                                                        view=self)
+
         except Exception as e:
             print(f"Error updating embed: {e}")
             try:
@@ -1250,7 +1224,7 @@ class EmbedEditorView(discord.ui.View):
             modal = TextInputModal(
                 title="Edit Footer",
                 label="Footer Text",
-                placeholder="Example: Bear Trap Notification System",
+                placeholder="Example: Notification System",
                 default_value=self.embed_data.get("footer", ""),
                 max_length=2048
             )
@@ -1301,7 +1275,8 @@ class EmbedEditorView(discord.ui.View):
             
             if modal.value:
                 if not modal.value.startswith(('http://', 'https://')):
-                    await interaction.followup.send("❌ Invalid URL! URL must start with 'http://' or 'https://'.", ephemeral=True)
+                    await interaction.followup.send("❌ Invalid URL! URL must start with 'http://' or 'https://'.",
+                                                    ephemeral=True)
                     return
 
                 self.embed_data["image_url"] = modal.value
@@ -1326,7 +1301,8 @@ class EmbedEditorView(discord.ui.View):
             
             if modal.value:
                 if not modal.value.startswith(('http://', 'https://')):
-                    await interaction.followup.send("❌ Invalid URL! URL must start with 'http://' or 'https://'.", ephemeral=True)
+                    await interaction.followup.send("❌ Invalid URL! URL must start with 'http://' or 'https://'.",
+                                                    ephemeral=True)
                     return
 
                 self.embed_data["thumbnail_url"] = modal.value
@@ -1363,18 +1339,6 @@ class EmbedEditorView(discord.ui.View):
             except:
                 pass
 
-    @discord.ui.button(label="Import Embed", style=discord.ButtonStyle.secondary, emoji="📥", row=2)
-    async def import_embed(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            modal = ImportEmbedModal(self)
-            await interaction.response.send_modal(modal)
-        except Exception as e:
-            print(f"Error showing import modal: {e}")
-            await interaction.followup.send(
-                "❌ An error occurred while importing the embed.",
-                ephemeral=True
-            )
-
 class MessageTypeView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone):
         super().__init__(timeout=300)
@@ -1395,8 +1359,8 @@ class MessageTypeView(discord.ui.View):
                 description="Get ready for Bear! Only %t remaining.",
                 color=discord.Color.blue()
             )
-            embed.set_footer(text="Bear Trap Notification System")
-            
+            embed.set_footer(text="Notification System")
+
             content = (
                 "📝 **Embed Editor**\n\n"
                 "**Note:** \n"
@@ -1419,7 +1383,7 @@ class MessageTypeView(discord.ui.View):
                 "title": embed.title,
                 "description": embed.description,
                 "color": embed.color.value,
-                "footer": "Bear Trap Notification System"
+                "footer": "Notification System"
             }
 
             await interaction.response.edit_message(
@@ -1619,7 +1583,8 @@ class NotificationTypeView(discord.ui.View):
 
     @discord.ui.button(label="Custom Times", style=discord.ButtonStyle.success, custom_id="type_6", row=2)
     async def type_6(self, interaction, button):
-        modal = CustomTimesModal(self.cog, self.start_date, self.hour, self.minute, self.timezone, self.message_data, self.channel_id, self.original_message)
+        modal = CustomTimesModal(self.cog, self.start_date, self.hour, self.minute, self.timezone, self.message_data,
+                                 self.channel_id, self.original_message)
         await interaction.response.send_modal(modal)
 
     async def show_mention_type_menu(self, interaction, notification_type):
@@ -1686,14 +1651,14 @@ class CustomTimesModal(discord.ui.Modal):
         try:
             times_str = self.custom_times.value.strip()
             times = [int(t) for t in times_str.split('-')]
-            
+
             if not all(isinstance(t, int) and t >= 0 for t in times):
                 raise ValueError("All times must be non-negative integers")
-                
+
             if not times:
                 raise ValueError("At least one time must be specified")
-                
-            if not all(times[i] > times[i+1] for i in range(len(times)-1)):
+
+            if not all(times[i] > times[i + 1] for i in range(len(times) - 1)):
                 raise ValueError("Times must be in descending order")
 
             embed = discord.Embed(
@@ -1738,8 +1703,10 @@ class CustomTimesModal(discord.ui.Modal):
                 ephemeral=True
             )
 
+
 class MentionTypeView(discord.ui.View):
-    def __init__(self, cog, start_date, hour, minute, timezone, message_data, channel_id, notification_type, original_message):
+    def __init__(self, cog, start_date, hour, minute, timezone, message_data, channel_id, notification_type,
+                 original_message):
         super().__init__(timeout=300)
         self.cog = cog
         self.start_date = start_date
@@ -1758,8 +1725,9 @@ class MentionTypeView(discord.ui.View):
                 description=(
                     "**Configure Notification Repeat**\n\n"
                     "Choose how often you want this notification to repeat:\n\n"
-                    "• No Repeat: Notification will be sent only once\n"
-                    "• Custom Interval: Set a custom repeat interval (minutes/hours/days/weeks/months)"
+                    "- No Repeat: Notification will be sent only once\n"
+                    "- Custom Interval: Set a custom repeat interval (minutes/hours/days/weeks/months)\n"
+                    "- Specific days: Choose which days of the week you want to get notifications on"
                 ),
                 color=discord.Color.blue()
             )
@@ -1970,6 +1938,8 @@ class BearTrapView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
+        self.conn = sqlite3.connect('db/beartime.sqlite')
+        self.cursor = self.conn.cursor()
 
     @discord.ui.button(
         label="Set Time",
@@ -1982,74 +1952,9 @@ class BearTrapView(discord.ui.View):
         if not await self.cog.check_admin(interaction):
             return
 
-        try:            
-            embed = discord.Embed(
-                title="⏰ Notification Creation Method",
-                description=(
-                    "Please select how you want to create the notification:\n\n"
-                    "**⚙️ Create in Discord**\n"
-                    "• For simple notifications\n"
-                    "• Quick setup\n"
-                    "• Basic features\n\n"
-                    "**🌐 Create on Website (Recommended)**\n"
-                    "• For advanced notifications\n"
-                    "• Customizable embeds\n"
-                    "• Rich text formatting\n"
-                    "• Custom color selection\n"
-                    "• Add images and thumbnails\n"
-                    "• Footer and author fields"
-                ),
-                color=discord.Color.blue()
-            )
-
-            view = discord.ui.View(timeout=300)
-
-            discord_button = discord.ui.Button(
-                label="Create in Discord",
-                emoji="⚙️",
-                style=discord.ButtonStyle.primary,
-                custom_id="create_in_discord"
-            )
-
-            async def discord_button_callback(discord_interaction):
-                modal = TimeSelectModal(self.cog)
-                await discord_interaction.response.send_modal(modal)
-
-            discord_button.callback = discord_button_callback
-
-            web_button = discord.ui.Button(
-                label="Create on Website",
-                emoji="🌐", 
-                style=discord.ButtonStyle.success,
-                custom_id="create_in_web"
-            )
-
-            async def web_button_callback(web_interaction):
-                try:
-                    editor_cog = self.cog.bot.get_cog('BearTrapEditor')
-                    if not editor_cog:
-                        await web_interaction.response.send_message(
-                            "❌ BearTrapEditor module not found!",
-                            ephemeral=True
-                        )
-                        return
-
-                    view = editor_cog.TimeSelectOptionsView(editor_cog)
-                    await view.start_setup(web_interaction)
-
-                except Exception as e:
-                    print(f"Error in web button: {e}")
-                    await web_interaction.response.send_message(
-                        "❌ An error occurred while starting the website process!",
-                        ephemeral=True
-                    )
-
-            web_button.callback = web_button_callback
-
-            view.add_item(discord_button)
-            view.add_item(web_button)
-
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        try:
+            modal = TimeSelectModal(self.cog)
+            await interaction.response.send_modal(modal)
 
         except Exception as e:
             error_msg = f"[ERROR] Error in set time button: {str(e)}\nType: {type(e)}\nTrace: {traceback.format_exc()}"
@@ -2068,496 +1973,6 @@ class BearTrapView(discord.ui.View):
                     )
             except Exception as notify_error:
                 print(f"[ERROR] Failed to notify user about error: {notify_error}")
-
-    @discord.ui.button(
-        label="Remove Notification",
-        emoji="🗑️",
-        style=discord.ButtonStyle.danger,
-        custom_id="remove_notification",
-        row=0
-    )
-    async def remove_notification_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.cog.check_admin(interaction):
-            return
-        try:
-            notifications = await self.cog.get_notifications(interaction.guild_id)
-            if not notifications:
-                await interaction.response.send_message(
-                    "❌ No notifications found for this server.",
-                    ephemeral=True
-                )
-                return
-
-            options = []
-            for notif in notifications:
-                display_description = notif[6].split('|')[-1] if '|' in notif[6] else notif[6]
-                if "EMBED_MESSAGE:" in display_description:
-                    display_description = "Embed Message"
-                elif display_description.startswith("PLAIN_MESSAGE:"):
-                    display_description = display_description.replace("PLAIN_MESSAGE:", "")
-                
-                options.append(
-                    discord.SelectOption(
-                        label=f"{notif[3]:02d}:{notif[4]:02d} - {display_description[:30]}",
-                        description=f"ID: {notif[0]}",
-                        value=str(notif[0])
-                    )
-                )
-            
-            options.sort(key=lambda option: option.label)
-                
-            view = SearchableSelectView(options, placeholder="Select a notification to remove")
-
-            async def select_callback(select_interaction: discord.Interaction):
-                try:
-                    notification_id = int(select_interaction.data["values"][0])
-                    selected_notif = next(n for n in notifications if n[0] == notification_id)
-
-                    notification_types = {
-                        1: "Sends notifications at 30 minutes, 10 minutes, 5 minutes before and when time's up",
-                        2: "Sends notifications at 10 minutes, 5 minutes before and when time's up",
-                        3: "Sends notifications at 5 minutes before and when time's up",
-                        4: "Sends notification only 5 minutes before",
-                        5: "Sends notification only when time's up",
-                        6: "Sends notifications at custom times"
-                    }
-
-                    mention_type = selected_notif[8]
-                    if mention_type == "everyone":
-                        mention_display = "@everyone"
-                    elif mention_type.startswith("role_"):
-                        role_id = int(mention_type.split('_')[1])
-                        role = select_interaction.guild.get_role(role_id)
-                        mention_display = f"@{role.name}" if role else f"Role: {role_id}"
-                    elif mention_type.startswith("member_"):
-                        member_id = int(mention_type.split('_')[1])
-                        member = select_interaction.guild.get_member(member_id)
-                        mention_display = f"@{member.display_name}" if member else f"Member: {member_id}"
-                    else:
-                        mention_display = "Unknown"
-
-                    if not selected_notif[9]:  
-                        repeat_text = "❌ No repeat"
-                    else:
-                        minutes = selected_notif[10]  
-                        if minutes == 1:
-                            repeat_text = "🔄 Repeats every minute"
-                        elif minutes == 60:
-                            repeat_text = "🔄 Repeats every hour"
-                        elif minutes == 1440:
-                            repeat_text = "🔄 Repeats daily"
-                        elif minutes == 2880:
-                            repeat_text = "🔄 Repeats every 2 days"
-                        elif minutes == 4320:
-                            repeat_text = "🔄 Repeats every 3 days"
-                        elif minutes == 10080:
-                            repeat_text = "🔄 Repeats weekly"
-                        else:
-                            repeat_text = f"🔄 Repeats every {minutes} minutes"
-
-                    embed = discord.Embed(
-                        title="🗑️ Remove Notification",
-                        description=(
-                            f"**📅 Date:** {datetime.fromisoformat(selected_notif[15]).strftime('%d/%m/%Y')}\n"
-                            f"**⏰ Time:** {selected_notif[3]:02d}:{selected_notif[4]:02d} {selected_notif[5]}\n"
-                            f"**📢 Channel:** <#{selected_notif[2]}>\n"
-                            f"**📝 Description:** {selected_notif[6].split('|')[-1] if '|' in selected_notif[6] else selected_notif[6]}\n\n"
-                            f"**⚙️ Notification Type**\n{notification_types[selected_notif[7]]}\n\n"
-                            f"**👥 Mentions:** {mention_display}\n"
-                            f"**🔄 Repeat:** {repeat_text}\n\n"
-                            "Are you sure you want to remove this notification?"
-                        ),
-                        color=discord.Color.red()
-                    )
-
-                    confirm_view = discord.ui.View()
-                    
-                    async def confirm_callback(confirm_interaction):
-                        try:
-                            self.cog.cursor.execute("DELETE FROM bear_notification_embeds WHERE notification_id = ?", (notification_id,))
-                            
-                            self.cog.cursor.execute("DELETE FROM notification_history WHERE notification_id = ?", (notification_id,))
-
-                            self.cog.cursor.execute("DELETE FROM bear_notifications WHERE id = ?", (notification_id,))
-                            
-                            self.cog.conn.commit()
-                            await confirm_interaction.response.edit_message(
-                                content="✅ Notification and its history have been removed successfully.",
-                                embed=None,
-                                view=None
-                            )
-                        except Exception as e:
-                            print(f"Error removing notification: {e}")
-                            await confirm_interaction.response.send_message(
-                                "❌ An error occurred while removing the notification.",
-                                ephemeral=True
-                            )
-
-                    async def cancel_callback(cancel_interaction):
-                        await cancel_interaction.response.edit_message(
-                            content="❌ Removal cancelled.",
-                            embed=None,
-                            view=None
-                        )
-
-                    confirm_button = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.danger)
-                    cancel_button = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
-                    
-                    confirm_button.callback = confirm_callback
-                    cancel_button.callback = cancel_callback
-                    
-                    confirm_view.add_item(confirm_button)
-                    confirm_view.add_item(cancel_button)
-                    
-                    await select_interaction.response.edit_message(embed=embed, view=confirm_view)
-                except Exception as e:
-                    print(f"Error in remove notification callback: {e}")
-                    await select_interaction.response.send_message(
-                        "❌ An error occurred while removing the notification.",
-                        ephemeral=True
-                    )
-
-            view.select.callback = select_callback
-            
-            await interaction.response.send_message(
-                "Select a notification:",
-                view=view,
-                ephemeral=True
-            )
-
-        except Exception as e:
-            print(f"Error in remove notification: {e}")
-            await interaction.response.send_message(
-                "❌ An error occurred while loading notifications.",
-                ephemeral=True
-            )
-
-    @discord.ui.button(
-        label="View Notifications",
-        emoji="📋",
-        style=discord.ButtonStyle.primary,
-        custom_id="view_notifications",
-        row=1
-    )
-    async def view_notifications_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.cog.check_admin(interaction):
-            return
-        try:
-            notifications = await self.cog.get_notifications(interaction.guild_id)
-            if not notifications:
-                await interaction.response.send_message(
-                    "❌ No notifications found for this server.",
-                    ephemeral=True
-                )
-                return
-
-            options = []
-            for notif in notifications:
-                status = "🟢 Enabled" if notif[11] else "🔴 Disabled"
-                
-                if "EMBED_MESSAGE:" in notif[6]:
-                    self.cog.cursor.execute("""
-                        SELECT title, description 
-                        FROM bear_notification_embeds 
-                        WHERE notification_id = ?
-                    """, (notif[0],))
-                    embed_data = self.cog.cursor.fetchone()
-                    
-                    if embed_data and embed_data[0]:
-                        display_description = f"📝 Embed: {embed_data[0]}"
-                    else:
-                        display_description = "📝 Embed Message"
-                else:
-                    display_description = notif[6].split('|')[-1] if '|' in notif[6] else notif[6]
-                    if display_description.startswith("PLAIN_MESSAGE:"):
-                        display_description = display_description.replace("PLAIN_MESSAGE:", "✍️ ")
-
-                options.append(
-                    discord.SelectOption(
-                        label=f"{notif[3]:02d}:{notif[4]:02d} - {display_description[:30]}",
-                        description=f"ID: {notif[0]} | {status}",
-                        value=str(notif[0])
-                    )
-                )
-                
-            options.sort(key=lambda option: option.label)
-            
-            view = SearchableSelectView(options, placeholder="Select a notification to view details")
-
-            async def select_callback(select_interaction: discord.Interaction):
-                try:
-                    notification_id = int(select_interaction.data["values"][0])
-                    selected_notif = next(n for n in notifications if n[0] == notification_id)
-
-                    notification_types = {
-                        1: "Sends notifications at 30 minutes, 10 minutes, 5 minutes before and when time's up",
-                        2: "Sends notifications at 10 minutes, 5 minutes before and when time's up",
-                        3: "Sends notifications at 5 minutes before and when time's up",
-                        4: "Sends notification only 5 minutes before",
-                        5: "Sends notification only when time's up",
-                        6: "Sends notifications at custom times"
-                    }
-
-                    mention_type = selected_notif[8]
-                    if mention_type == "everyone":
-                        mention_display = "@everyone"
-                    elif mention_type.startswith("role_"):
-                        role_id = int(mention_type.split('_')[1])
-                        role = select_interaction.guild.get_role(role_id)
-                        mention_display = f"@{role.name}" if role else f"Role: {role_id}"
-                    elif mention_type.startswith("member_"):
-                        member_id = int(mention_type.split('_')[1])
-                        member = select_interaction.guild.get_member(member_id)
-                        mention_display = f"@{member.display_name}" if member else f"Member: {member_id}"
-                    else:
-                        mention_display = "Unknown"
-
-                    if not selected_notif[9]:  
-                        repeat_text = "❌ No repeat"
-                    else:
-                        minutes = selected_notif[10]  
-                        if minutes == 1:
-                            repeat_text = "🔄 Repeats every minute"
-                        elif minutes == 60:
-                            repeat_text = "🔄 Repeats every hour"
-                        elif minutes == 1440:
-                            repeat_text = "🔄 Repeats daily"
-                        elif minutes == 2880:
-                            repeat_text = "🔄 Repeats every 2 days"
-                        elif minutes == 4320:
-                            repeat_text = "🔄 Repeats every 3 days"
-                        elif minutes == 10080:
-                            repeat_text = "🔄 Repeats weekly"
-                        else:
-                            repeat_text = f"🔄 Repeats every {minutes} minutes"
-
-                    embed_data = None
-                    if "EMBED_MESSAGE:" in selected_notif[6]:
-                        self.cog.cursor.execute("""
-                            SELECT title, description, color, image_url, thumbnail_url, footer, author, mention_message
-                            FROM bear_notification_embeds 
-                            WHERE notification_id = ?
-                        """, (notification_id,))
-                        embed_result = self.cog.cursor.fetchone()
-                        if embed_result:
-                            embed_data = {
-                                'title': embed_result[0],
-                                'description': embed_result[1],
-                                'color': embed_result[2],
-                                'image_url': embed_result[3],
-                                'thumbnail_url': embed_result[4],
-                                'footer': embed_result[5],
-                                'author': embed_result[6],
-                                'mention_message': embed_result[7]
-                            }
-
-                    details_embed = discord.Embed(
-                        title="📋 Notification Details",
-                        description=(
-                            f"**📅 Date:** {datetime.fromisoformat(selected_notif[15]).strftime('%d/%m/%Y')}\n"
-                            f"**⏰ Time:** {selected_notif[3]:02d}:{selected_notif[4]:02d} {selected_notif[5]}\n"
-                            f"**📢 Channel:** <#{selected_notif[2]}>\n"
-                            f"**📝 Description:** {selected_notif[6].split('|')[-1] if '|' in selected_notif[6] else selected_notif[6]}\n\n"
-                            f"**⚙️ Notification Type**\n{notification_types[selected_notif[7]]}\n\n"
-                            f"**👥 Mentions:** {mention_display}\n"
-                            f"**🔄 Repeat:** {repeat_text}"
-                        ),
-                        color=discord.Color.blue()
-                    )
-
-                    if embed_data:
-                        preview_embed = discord.Embed(
-                            title=embed_data['title'] if embed_data['title'] else "No Title",
-                            description=embed_data['description'] if embed_data['description'] else "No Description",
-                            color=embed_data['color'] if embed_data['color'] else discord.Color.blue()
-                        )
-                        
-                        if embed_data['image_url']:
-                            preview_embed.set_image(url=embed_data['image_url'])
-                        if embed_data['thumbnail_url']:
-                            preview_embed.set_thumbnail(url=embed_data['thumbnail_url'])
-                        if embed_data['footer']:
-                            preview_embed.set_footer(text=embed_data['footer'])
-                        if embed_data['author']:
-                            preview_embed.set_author(name=embed_data['author'])
-
-                        mention_preview = ""
-                        if embed_data['mention_message']:
-                            mention_preview = embed_data['mention_message']
-                            example_time = "30 minutes"
-                            if "%t" in mention_preview:
-                                mention_preview = mention_preview.replace("%t", example_time)
-                            if "{time}" in mention_preview:
-                                mention_preview = mention_preview.replace("{time}", example_time)
-
-                        copyable_data = {
-                            'title': embed_data['title'],
-                            'description': embed_data['description'],
-                            'color': embed_data['color'],
-                            'footer': embed_data['footer'],
-                            'author': embed_data['author'],
-                            'image_url': embed_data['image_url'],
-                            'thumbnail_url': embed_data['thumbnail_url'],
-                            'mention_message': embed_data['mention_message']
-                        }
-                        
-                        embed_json = json.dumps(copyable_data, indent=2)
-
-                        back_view = discord.ui.View()
-                        back_button = discord.ui.Button(
-                            label="Back to List", 
-                            style=discord.ButtonStyle.secondary
-                        )
-                        
-                        async def back_callback(back_interaction):
-                            new_view = SearchableSelectView(options, placeholder="Select a notification to view details")
-                            new_view.select.callback = select_callback
-                            
-                            await back_interaction.response.edit_message(
-                                content="Select a notification:",
-                                embeds=[],
-                                view=new_view
-                            )
-                            
-                        back_button.callback = back_callback
-                        back_view.add_item(back_button)
-
-                        content = "**📋 Notification Details**\n\n"
-                        content += f"**Embed Code:**\n```json\n{embed_json}\n```\n"
-                        if mention_preview:
-                            content += f"**Message Preview:**\n{mention_preview}"
-
-                        await select_interaction.response.edit_message(
-                            content=content,
-                            embeds=[details_embed, preview_embed],
-                            view=back_view
-                        )
-                    else:
-                        back_view = discord.ui.View()
-                        back_button = discord.ui.Button(
-                            label="Back to List", 
-                            style=discord.ButtonStyle.secondary
-                        )
-                        
-                        async def back_callback(back_interaction):
-                            new_view = SearchableSelectView(options, placeholder="Select a notification to view details")
-                            new_view.select.callback = select_callback
-                            
-                            await back_interaction.response.edit_message(
-                                content="Select a notification:",
-                                embeds=[],
-                                view=new_view
-                            )
-                            
-                        back_button.callback = back_callback
-                        back_view.add_item(back_button)
-                        
-                        message_preview = None
-                        if "PLAIN_MESSAGE:" in selected_notif[6]:
-                            message_preview = selected_notif[6].replace("PLAIN_MESSAGE:", "")
-                        
-                        await select_interaction.response.edit_message(
-                            content="**📋 Notification Details**" + 
-                                (f"\n\n**Message Preview:**\n{message_preview}" if message_preview else ""),
-                            embed=details_embed,
-                            view=back_view
-                        )
-
-                except Exception as e:
-                    print(f"Error in select callback: {e}")
-                    await select_interaction.response.send_message(
-                        "❌ An error occurred while processing your selection.",
-                        ephemeral=True
-                    )
-
-            view.select.callback = select_callback
-            
-            await interaction.response.send_message(
-                "Select a notification:",
-                view=view,
-                ephemeral=True
-            )
-
-        except Exception as e:
-            print(f"Error viewing notifications: {e}")
-            await interaction.response.send_message(
-                "❌ An error occurred while loading notifications.",
-                ephemeral=True
-            )
-
-    @discord.ui.button(
-        label="Enable/Disable",
-        emoji="✅",
-        style=discord.ButtonStyle.primary,
-        custom_id="toggle_notifications",
-        row=1
-    )
-    async def toggle_notifications_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not await self.cog.check_admin(interaction):
-            return
-        try:
-            notifications = await self.cog.get_notifications(interaction.guild_id)
-            if not notifications:
-                await interaction.response.send_message(
-                    "❌ No notifications found for this server.",
-                    ephemeral=True
-                )
-                return
-
-            options = []
-            for notif in notifications:
-                status = "🟢 Enabled" if notif[11] else "🔴 Disabled"
-                display_description = notif[6].split('|')[-1] if '|' in notif[6] else notif[6]
-                if "EMBED_MESSAGE:" in display_description:
-                    display_description = "Embed Message"
-                elif display_description.startswith("PLAIN_MESSAGE:"):
-                    display_description = display_description.replace("PLAIN_MESSAGE:", "")
-                    
-                options.append(
-                    discord.SelectOption(
-                        label=f"{notif[3]:02d}:{notif[4]:02d} - {display_description[:30]}",
-                        description=f"ID: {notif[0]} | {status}",
-                        value=str(notif[0])
-                    )
-                )
-                
-            options.sort(key=lambda option: option.label)
-            
-            view = SearchableSelectView(options, placeholder="Select a notification to toggle")
-
-            async def select_callback(select_interaction: discord.Interaction):
-                notification_id = int(select_interaction.data["values"][0])
-                current_status = next(n[11] for n in notifications if n[0] == notification_id)
-                new_status = not current_status
-                
-                if await self.cog.toggle_notification(notification_id, new_status):
-                    status_text = "enabled" if new_status else "disabled"
-                    embed = discord.Embed(
-                        title="✅ Notification Status Updated",
-                        description=f"The notification has been {status_text}.",
-                        color=discord.Color.green() if new_status else discord.Color.red()
-                    )
-                    await select_interaction.response.edit_message(embed=embed, view=None)
-                else:
-                    await select_interaction.response.send_message(
-                        "❌ Failed to update notification status.",
-                        ephemeral=True
-                    )
-
-            view.select.callback = select_callback
-            
-            await interaction.response.send_message(
-                "Select a notification:",
-                view=view,
-                ephemeral=True
-            )
-
-        except Exception as e:
-            print(f"Error in toggle notifications: {e}")
-            await interaction.response.send_message(
-                "❌ An error occurred while loading notifications.",
-                ephemeral=True
-            )
 
     @discord.ui.button(
         label="Main Menu",
@@ -2581,89 +1996,598 @@ class BearTrapView(discord.ui.View):
             )
 
     @discord.ui.button(
-        label="Edit",
-        emoji="✏️",
+        label="Manage notification",
+        emoji="📋",
         style=discord.ButtonStyle.primary,
-        custom_id="edit_notification",
-        row=1
+        custom_id="manage_notification",
+        row=0
     )
-    async def edit_notification_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def manage_notification_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await self.cog.check_admin(interaction):
             return
         try:
             notifications = await self.cog.get_notifications(interaction.guild_id)
+            original_notifications = notifications.copy()
+            search_keywords = []
             if not notifications:
                 await interaction.response.send_message(
-                    "❌ No notifications found to edit in this server.",
+                    "❌ No notifications found in this server.",
                     ephemeral=True
                 )
                 return
 
-            options = []
-            for notif in notifications:
-                status = "🟢 Enabled" if notif[11] else "🔴 Disabled"
-                
-                if "EMBED_MESSAGE:" in notif[6]:
-                    self.cog.cursor.execute("""
-                        SELECT title, description 
-                        FROM bear_notification_embeds 
-                        WHERE notification_id = ?
-                    """, (notif[0],))
-                    embed_data = self.cog.cursor.fetchone()
-                    
-                    if embed_data and embed_data[0]:
-                        display_description = f"📝 Embed: {embed_data[0]}"
+            page_size = 25
+            total_pages = (len(notifications) // page_size) + (1 if len(notifications) % page_size != 0 else 0)
+            current_page = 0
+
+            def get_page_option(page):
+                start = page * page_size
+                end = start + page_size
+                page_notifications = notifications[start:end]
+
+                options = []
+                for notif in page_notifications:
+                    status = "🟢 Enabled" if notif[11] else "🔴 Disabled"
+
+                    if "EMBED_MESSAGE:" in notif[6]:
+                        self.cog.cursor.execute("""
+                            SELECT title, description 
+                            FROM bear_notification_embeds 
+                            WHERE notification_id = ? 
+                        """, (notif[0],))
+                        embed_data = self.cog.cursor.fetchone()
+
+                        if embed_data and embed_data[0]:
+                            display_description = f"📝 Embed: {embed_data[0]}"
+                        else:
+                            display_description = "📝 Embed Message"
                     else:
-                        display_description = "📝 Embed Message"
-                else:
-                    display_description = notif[6].split('|')[-1] if '|' in notif[6] else notif[6]
-                    if display_description.startswith("PLAIN_MESSAGE:"):
-                        display_description = display_description.replace("PLAIN_MESSAGE:", "✍️ ")
+                        display_description = notif[6].split('|')[-1] if '|' in notif[6] else notif[6]
+                        if display_description.startswith("PLAIN_MESSAGE:"):
+                            display_description = display_description.replace("PLAIN_MESSAGE:", "✍️ ")
 
-                options.append(
-                    discord.SelectOption(
-                        label=f"{notif[3]:02d}:{notif[4]:02d} - {display_description[:30]}",
-                        description=f"ID: {notif[0]} | {status}",
-                        value=str(notif[0])
-                    )
-                )
-                
-            options.sort(key=lambda option: option.label)
-
-            view = SearchableSelectView(options, placeholder="Select a notification to edit")
-
-            async def select_callback(select_interaction: discord.Interaction):
-                try:
-                    notification_id = int(select_interaction.data["values"][0])
-                    editor_cog = self.cog.bot.get_cog('BearTrapEditor')
-                    if editor_cog:
-                        await editor_cog.start_edit_process(select_interaction, notification_id)
-                    else:
-                        await select_interaction.response.send_message(
-                            "❌ Editor module not found!",
-                            ephemeral=True
+                    options.append(
+                        discord.SelectOption(
+                            label=f"{notif[3]:02d}:{notif[4]:02d} - {display_description[:30]}",
+                            description=f"ID: {notif[0]} | {status}",
+                            value=f"{notif[0]}|embed" if "EMBED_MESSAGE:" in notif[6] else f"{notif[0]}|plain"
                         )
+                    )
+                if len(options) > 25:
+                    options = options[:25]
+                return options
+
+            select = discord.ui.Select(
+                placeholder=f"Page {current_page + 1}/{total_pages} — Select a notification to view",
+                options=get_page_option(current_page)
+            )
+
+            class PaginationButton(discord.ui.Button):
+                def __init__(self, label, page_change):
+                    super().__init__(label=label, style=discord.ButtonStyle.primary)
+                    self.page_change = page_change
+
+                async def callback(self, interaction: discord.Interaction):
+                    nonlocal current_page
+                    new_page = current_page + self.page_change
+                    if 0 <= new_page < total_pages:
+                        current_page = new_page
+
+                        new_options = get_page_option(current_page)
+                        select.options = new_options
+                        select.placeholder = f"Page {current_page + 1}/{total_pages} — Select a notification to view"
+
+                        prev_button.disabled = current_page == 0
+                        next_button.disabled = current_page == total_pages - 1
+
+                        await interaction.response.edit_message(
+                            view=view
+                        )
+
+            prev_button = PaginationButton(label="⬅️ Previous", page_change=-1)
+            prev_button.disabled = current_page == 0
+            next_button = PaginationButton(label="Next ➡️", page_change=1)
+
+            class SearchButton(discord.ui.Button):
+                def __init__(self, label, cog):
+                    super().__init__(label=label, style=discord.ButtonStyle.primary)
+                    self.cog = cog
+
+                async def callback(self, interaction: discord.Interaction):
+                    class SearchModal(discord.ui.Modal, title="Search Notifications"):
+                        keyword = discord.ui.TextInput(
+                            label="Search Term",
+                            placeholder="Enter text to search for..."
+                        )
+
+                        async def on_submit(modal_self, interaction: discord.Interaction):
+                            nonlocal notifications, current_page, total_pages
+
+                            keyword_value = modal_self.keyword.value
+                            keyword_lower = keyword_value.lower()
+                            filtered = []
+                            
+                            for n in notifications:
+                                if "EMBED_MESSAGE:" in n[6]:
+                                    button_self.cog.cursor.execute("SELECT title FROM bear_notification_embeds WHERE notification_id = ?", (n[0],))
+                                    embed_data = button_self.cog.cursor.fetchone()
+                                    display_text = embed_data[0] if embed_data and embed_data[0] else "Embed Message"
+                                else:
+                                    display_text = n[6].split('|')[-1] if '|' in n[6] else n[6]
+                                    if display_text.startswith("PLAIN_MESSAGE:"):
+                                        display_text = display_text.replace("PLAIN_MESSAGE:", "", 1)
+                                
+                                if keyword_lower in display_text.lower():
+                                    filtered.append(n)
+
+                            if not filtered:
+                                if search_keywords:
+                                    prev_keywords_display = " and ".join(f"`{k}`" for k in search_keywords)
+                                    message = (
+                                        f"❌ No notifications found with `{keyword_value}` "
+                                        f"among those already filtered by: {prev_keywords_display}"
+                                    )
+                                else:
+                                    message = f"❌ No notifications found for keyword `{keyword_value}`."
+
+                                await interaction.response.send_message(message, ephemeral=True)
+                                return
+
+                            search_keywords.append(keyword_value)
+
+                            notifications = filtered
+                            current_page = 0
+                            total_pages = (len(notifications) // page_size) + (
+                                1 if len(notifications) % page_size != 0 else 0
+                            )
+
+                            select.options = get_page_option(current_page)
+                            select.placeholder = f"Page {current_page + 1}/{total_pages} — Select a notification to view"
+
+                            reset_button.disabled = not search_keywords
+                            prev_button.disabled = current_page == 0
+                            next_button.disabled = current_page == total_pages - 1
+
+                            keywords_display = " and ".join(f"`{k}`" for k in search_keywords)
+                            content_message = f"🔍 Showing notifications that contain the keyword(s): {keywords_display}"
+
+                            await interaction.response.edit_message(content=content_message, view=view)
+
+                    button_self = self
+                    await interaction.response.send_modal(SearchModal())
+
+            search_button = SearchButton(label="🔍 Search", cog=self.cog)
+
+            class ResetButton(discord.ui.Button):
+                def __init__(self, label):
+                    super().__init__(label=label, style=discord.ButtonStyle.secondary)
+
+                async def callback(self, interaction: discord.Interaction):
+                    nonlocal notifications, original_notifications, current_page, total_pages
+
+                    notifications = original_notifications.copy()
+                    search_keywords.clear()
+                    current_page = 0
+                    total_pages = (len(notifications) // page_size) + (1 if len(notifications) % page_size != 0 else 0)
+
+                    select.options = get_page_option(current_page)
+                    select.placeholder = f"Page {current_page + 1}/{total_pages} — Select a notification to view"
+
+                    reset_button.disabled = not search_keywords
+                    prev_button.disabled = current_page == 0
+                    next_button.disabled = current_page == total_pages - 1
+
+                    await interaction.response.edit_message(content="Showing all notifications.", view=view)
+
+            reset_button = ResetButton(label="🔄 Reset Filter")
+            reset_button.disabled = not search_keywords
+
+            async def select_callback(select_interaction):
+                try:
+                    selected_value = select_interaction.data["values"][0]
+                    notification_id, notif_type = selected_value.split("|")
+                    notification_id = int(notification_id)
+
+                    selected_notif = next(n for n in notifications if n[0] == notification_id)
+
+                    notification_types = {
+                        1: "Sends notifications at 30 minutes, 10 minutes, 5 minutes before and when time's up",
+                        2: "Sends notifications at 10 minutes, 5 minutes before and when time's up",
+                        3: "Sends notifications at 5 minutes before and when time's up",
+                        4: "Sends notification only 5 minutes before",
+                        5: "Sends notification only when time's up",
+                        6: "Sends notifications at custom times"
+                    }
+                    notification_type_desc = notification_types.get(selected_notif[7], "Unknown Type")
+
+                    mention_display = selected_notif[8]
+                    if mention_display.startswith("role_"):
+                        mention_display = f"<@&{mention_display.split('_')[1]}>"
+                    elif mention_display.startswith("member_"):
+                        mention_display = f"<@{mention_display.split('_')[1]}>"
+                    elif mention_display == "everyone":
+                        mention_display = "@everyone"
+                    elif mention_display == "none":
+                        mention_display = "No mention"
+
+                    repeat_minutes = selected_notif[10]
+                    time_units = [
+                        ("month", 43200),
+                        ("week", 10080),
+                        ("day", 1440),
+                        ("hour", 60),
+                        ("minute", 1),
+                    ]
+
+                    formatted_repeat = "❌ No repeat"
+                    if isinstance(repeat_minutes, int) and repeat_minutes > 0:
+                        result = []
+                        for name, unit in time_units:
+                            value = repeat_minutes // unit
+                            if value > 0:
+                                result.append(f"{value} {name}{'s' if value > 1 else ''}")
+                                repeat_minutes %= unit
+                        formatted_repeat = " and ".join(result)
+
+                    elif repeat_minutes == "fixed":
+                        self.cursor.execute("""
+                                SELECT weekday FROM notification_days
+                                WHERE notification_id = ?
+                            """, (selected_notif[0],))
+                        rows = self.cursor.fetchall()
+
+                        weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                        day_set = set()
+                        for row in rows:
+                            for part in row[0].split('|'):
+                                if part.strip().isdigit():
+                                    day_set.add(int(part))
+
+                        sorted_days = sorted(day_set)
+                        day_list = [weekday_names[day] for day in sorted_days]
+
+                        if len(day_list) == 1:
+                            formatted_repeat = f"Every {day_list[0]}"
+                        else:
+                            formatted_repeat = "Every " + ", ".join(day_list[:-1]) + " and " + day_list[-1]
+
+                    details_embed = discord.Embed(
+                        title=f"📋 Notification Details",
+                        description=(
+                            f"**📅 Next Notification date:** {datetime.fromisoformat(selected_notif[15]).strftime('%d/%m/%Y')}\n"
+                            f"**⏰ Time:** {selected_notif[3]:02d}:{selected_notif[4]:02d} ({selected_notif[5]})\n"
+                            f"**📢 Channel:** <#{selected_notif[2]}>\n"
+                            f"**📝 Description:** {selected_notif[6]}\n\n"
+                            f"**⚙️ Notification Type:** \n{notification_type_desc}\n\n"
+                            f"**👥 Mention:** {mention_display}\n"
+                            f"**🔄 Repeat:** {formatted_repeat}\n"),
+                        color=discord.Color.blue()
+                    )
+
+                    view = discord.ui.View()
+
+                    class PreviewButton(discord.ui.Button):
+                        def __init__(self, cog, notification_id):
+                            super().__init__(label="👀 Preview", style=discord.ButtonStyle.primary)
+                            self.cog = cog
+                            self.notification_id = notification_id
+
+                        async def callback(self, interaction: discord.Interaction):
+                            try:
+                                self.cog.cursor.execute(
+                                    """SELECT channel_id, hour, minute, description, mention_type, next_notification
+                                       FROM bear_notifications WHERE id = ?""",
+                                    (self.notification_id,)
+                                )
+                                selected_notif = self.cog.cursor.fetchone()
+
+                                if not selected_notif:
+                                    await interaction.response.send_message("❌ Notification not found.", ephemeral=True)
+                                    return
+
+                                channel_id, hours, minutes, description, mention_type, next_notification = selected_notif
+
+                                embed_data = None
+                                if "EMBED_MESSAGE:" in description:
+                                    self.cog.cursor.execute("""
+                                        SELECT title, description, color, image_url, thumbnail_url, footer, author, mention_message
+                                        FROM bear_notification_embeds WHERE notification_id = ?
+                                    """, (self.notification_id,))
+                                    embed_result = self.cog.cursor.fetchone()
+
+                                    if embed_result:
+                                        embed_data = {
+                                            'title': embed_result[0],
+                                            'description': embed_result[1],
+                                            'color': embed_result[2],
+                                            'image_url': embed_result[3],
+                                            'thumbnail_url': embed_result[4],
+                                            'footer': embed_result[5],
+                                            'author': embed_result[6],
+                                            'mention_message': embed_result[7]
+                                        }
+                                mention_display = ""
+                                if mention_type.startswith("role_"):
+                                    mention_display = f"<@&{mention_type.split('_')[1]}>"
+                                elif mention_type.startswith("member_"):
+                                    mention_display = f"<@{mention_type.split('_')[1]}>"
+                                elif mention_type == "everyone":
+                                    mention_display = "@everyone"
+                                elif mention_type == "none":
+                                    mention_display = ""
+
+                                preview_embed = None
+                                if embed_data:
+                                    mention_preview = embed_data['mention_message'] if embed_data[
+                                        'mention_message'] else ""
+                                    mention_preview = mention_preview.replace("@tag", mention_display)
+
+                                    preview_embed = discord.Embed(
+                                        title=embed_data['title'] if embed_data['title'] else "No Title",
+                                        description=embed_data['description'] if embed_data[
+                                            'description'] else "No Description",
+                                        color=embed_data['color'] if embed_data['color'] else discord.Color.blue()
+                                    )
+
+                                    if embed_data['image_url']:
+                                        preview_embed.set_image(url=embed_data['image_url'])
+                                    if embed_data['thumbnail_url']:
+                                        preview_embed.set_thumbnail(url=embed_data['thumbnail_url'])
+                                    if embed_data['footer']:
+                                        preview_embed.set_footer(text=embed_data['footer'])
+                                    if embed_data['author']:
+                                        preview_embed.set_author(name=embed_data['author'])
+
+                                    # Create copyable JSON data for the embed
+                                    copyable_data = {
+                                        'title': embed_data['title'],
+                                        'description': embed_data['description'],
+                                        'color': embed_data['color'],
+                                        'footer': embed_data['footer'],
+                                        'author': embed_data['author'],
+                                        'image_url': embed_data['image_url'],
+                                        'thumbnail_url': embed_data['thumbnail_url'],
+                                        'mention_message': embed_data['mention_message']
+                                    }
+
+                                    embed_json = json.dumps(copyable_data, indent=2)
+
+                                    # Create view with a "Show Code" button
+                                    view = discord.ui.View()
+                                    view.add_item(ShowCodeButton(embed_json))
+
+                                    await interaction.response.send_message(
+                                        content=mention_preview,
+                                        embed=preview_embed,
+                                        view=view,
+                                        ephemeral=True
+                                    )
+                                else:
+                                    message_preview = description.split("PLAIN_MESSAGE:", 1)[-1].strip()
+                                    message_preview = message_preview.replace("@tag", mention_display)
+
+                                    await interaction.response.send_message(
+                                        content=message_preview,
+                                        ephemeral=True
+                                    )
+
+                            except Exception as e:
+                                print(f"[ERROR] Exception in PreviewButton: {e}")
+                                await interaction.response.send_message(
+                                    "❌ An error occurred while fetching the preview.", ephemeral=True)
+
+                    class ShowCodeButton(discord.ui.Button):
+                        def __init__(self, embed_json):
+                            super().__init__(label="💾 Show Code", style=discord.ButtonStyle.secondary)
+                            self.embed_json = embed_json
+
+                        async def callback(self, interaction: discord.Interaction):
+                            await interaction.response.send_message(
+                                content=f"```json\n{self.embed_json}\n```",
+                                ephemeral=True
+                            )
+
+                    class DeleteButton(discord.ui.Button):
+                        def __init__(self, cog, notification_id):
+                            super().__init__(label="🗑️ Delete", style=discord.ButtonStyle.danger)
+                            self.cog = cog
+                            self.notification_id = notification_id
+
+                        async def callback(self, interaction: discord.Interaction):
+                            try:
+                                confirm_view = discord.ui.View()
+
+                                confirm_button = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.danger)
+                                cancel_button = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.primary)
+
+                                async def confirm_callback(interaction: discord.Interaction):
+                                    try:
+                                        result = await self.cog.delete_notification(self.notification_id)
+
+                                        if result:
+                                            new_view = discord.ui.View()
+
+                                            for row in interaction.message.components:
+                                                for item in row.children:
+                                                    if isinstance(item, discord.ui.Button) and item.label not in [
+                                                        "Confirm", "Cancel"]:
+                                                        new_view.add_item(
+                                                            item)
+
+                                            await interaction.response.edit_message(view=new_view)
+                                            await interaction.followup.send("✅ Successfully deleted.", ephemeral=True)
+
+                                        else:
+                                            print(f"[DEBUG] Deletion failed for notification_id {self.notification_id}")
+                                            await interaction.response.send_message(
+                                                "❌ Failed to delete the notification.", ephemeral=True
+                                            )
+
+                                    except Exception as e:
+                                        print(f"[ERROR] Exception in confirm_callback: {e}")
+                                        await interaction.response.send_message(
+                                            "❌ An error occurred while deleting the notification.", ephemeral=True
+                                        )
+
+                                async def cancel_callback(interaction: discord.Interaction):
+                                    try:
+                                        await interaction.response.edit_message(
+                                            content=(
+                                                "- **🔍 Search:** Filter the menu options based on specific keywords\n"
+                                                "- **📝 Edit:** Modify notification details.\n"
+                                                "- **🚨 Notification is active/inactive:** Toggles between enabling or disabling the notification.\n"
+                                                "  - -# Click to toggle between enabling or disabling.\n"
+                                                "  - -# Enabling a non-repeating notification will keep its time but change its date to today's date or tomorrow if the time had passed.\n"
+                                                "- **👀 Preview:** See how the notification will look when it's sent.\n"
+                                                "- **🗑️ Delete:** Remove the selected notification.\n\n"
+                                            ),
+                                            view=view
+                                        )
+                                    except Exception as e:
+                                        print(f"[ERROR] Exception in cancel callback: {e}")
+
+                                confirm_button.callback = confirm_callback
+                                cancel_button.callback = cancel_callback
+                                confirm_view.add_item(confirm_button)
+                                confirm_view.add_item(cancel_button)
+
+                                await interaction.response.edit_message(
+                                    content="Are you sure you want to delete this notification?",
+                                    view=confirm_view
+                                )
+
+                            except Exception as e:
+                                print(f"[ERROR] Exception in DeleteButton callback: {e}")
+                                await interaction.response.send_message(
+                                    "❌ An error occurred while attempting to delete the notification.",
+                                    ephemeral=True
+                                )
+
+                    class EditButton(discord.ui.Button):
+                        def __init__(self):
+                            super().__init__(label="📝 Edit", style=discord.ButtonStyle.primary)
+
+                        async def callback(self, button_interaction: discord.Interaction):
+                            editor_cog = self.view.editor_cog
+                            if editor_cog:
+                                try:
+                                    await editor_cog.start_edit_process(button_interaction, notification_id)
+                                except Exception as e:
+                                    print(f"Error in starting edit process: {e}")
+                            else:
+                                await button_interaction.response.send_message(
+                                    "❌ Editor module not found!",
+                                    ephemeral=True
+                                )
+
+                    class ToggleButton(discord.ui.Button):
+                        def __init__(self, cog, notification_id, edit_button, select):
+                            self.cog = cog
+                            self.notification_id = notification_id
+                            self.edit_button = edit_button
+                            self.select = select
+
+                            self.cog.cursor.execute("""
+                                SELECT is_enabled FROM bear_notifications WHERE id = ? 
+                            """, (self.notification_id,))
+                            current_status = self.cog.cursor.fetchone()
+
+                            initial_label = "🟢 Notification is active" if current_status and current_status[
+                                0] else "🔴 Notification is inactive"
+                            super().__init__(label=initial_label,
+                                             style=discord.ButtonStyle.success if current_status and current_status[
+                                                 0] else discord.ButtonStyle.danger)
+
+                        async def callback(self, interaction: discord.Interaction):
+                            try:
+                                self.cog.cursor.execute("""
+                                    SELECT is_enabled FROM bear_notifications WHERE id = ? 
+                                """, (self.notification_id,))
+                                current_status = self.cog.cursor.fetchone()
+
+                                if current_status is None:
+                                    await interaction.response.send_message("❌ Notification not found.", ephemeral=True)
+                                    return
+
+                                new_status = not bool(current_status[0])
+
+                                result = await self.cog.toggle_notification(self.notification_id, new_status)
+
+                                if result:
+                                    new_label = "🟢 Notification is active" if new_status else "🔴 Notification is inactive"
+                                    new_style = discord.ButtonStyle.success if new_status else discord.ButtonStyle.danger
+                                    self.label = new_label
+                                    self.style = new_style
+
+                                    await interaction.response.edit_message(view=view)
+
+                                else:
+                                    await interaction.response.send_message("❌ Failed to toggle notification.",
+                                                                            ephemeral=True)
+
+                            except Exception as e:
+                                print(f"[ERROR] Exception in ToggleButton callback: {e}")
+                                await interaction.response.send_message(
+                                    "❌ An error occurred while toggling notification!", ephemeral=True
+                                )
+
+                    view.add_item(select)
+                    if total_pages > 1:
+                        view.add_item(prev_button)
+                        view.add_item(next_button)
+                    view.add_item(search_button)
+                    view.add_item(reset_button)
+                    view.add_item(EditButton())
+                    view.add_item(ToggleButton(self.cog, notification_id, EditButton(), select))
+                    view.add_item(PreviewButton(self.cog, notification_id))
+                    view.add_item(DeleteButton(self.cog, notification_id))
+
+                    editor_cog = self.cog.bot.get_cog('NotificationEditor')
+                    view.editor_cog = editor_cog
+
+                    await select_interaction.response.edit_message(
+                        content=(
+                            "- **🔍 Search:** Filter the menu options based on specific keywords\n"
+                            "- **📝 Edit:** Modify notification details.\n"
+                            "- **⚙️ Notification is active/inactive:** Toggles between enabling or disabling the notification.\n"
+                            "  - -# Click to toggle between enabling or disabling.\n"
+                            "  - -# Enabling a non-repeating notification will keep its time but change its date to today's date or tomorrow if the time had passed.\n"
+                            "- **👀 Preview:** See how the notification will look when it's sent.\n"
+                            "- **🗑️ Delete:** Remove the selected notification.\n\n"
+                        ),
+                        embed=details_embed,
+                        view=view
+                    )
+
                 except Exception as e:
-                    print(f"Error in edit notification callback: {e}")
+                    print(f"[ERROR] Error in select callback: {e}")
                     await select_interaction.response.send_message(
-                        "❌ An error occurred during editing!",
+                        "❌ An error occurred while editing notification!",
                         ephemeral=True
                     )
 
-            view.select.callback = select_callback
-            
+            select.callback = select_callback
+
+            view = discord.ui.View()
+            view.add_item(select)
+            if total_pages > 1:
+                view.add_item(prev_button)
+                view.add_item(next_button)
+            view.add_item(search_button)
+            view.add_item(reset_button)
+
             await interaction.response.send_message(
-                "Select a notification:",
                 view=view,
                 ephemeral=True
             )
 
         except Exception as e:
-            print(f"Error in edit button: {e}")
+            print(f"[ERROR] Error in manage_notification button: {e}")
             await interaction.response.send_message(
                 "❌ An error occurred while starting the edit process!",
                 ephemeral=True
             )
+
 
 class ChannelSelectView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone, message_data, original_message):
@@ -2675,8 +2599,9 @@ class ChannelSelectView(discord.ui.View):
         self.timezone = timezone
         self.message_data = message_data
         self.original_message = original_message
-        
+
         self.add_item(ChannelSelectMenu(self))
+
 
 class ChannelSelectMenu(discord.ui.ChannelSelect):
     def __init__(self, view):
@@ -2764,61 +2689,5 @@ class ChannelSelectMenu(discord.ui.ChannelSelect):
                     ephemeral=True
                 )
 
-class ImportEmbedModal(discord.ui.Modal):
-    def __init__(self, embed_view):
-        super().__init__(title="Import Embed")
-        self.embed_view = embed_view
-        
-        self.embed_code = discord.ui.TextInput(
-            label="Embed Code",
-            placeholder="Paste the embed code here...",
-            style=discord.TextStyle.paragraph,
-            required=True
-        )
-        self.add_item(self.embed_code)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        try:
-            embed_data = json.loads(self.embed_code.value)
-            
-            self.embed_view.embed_data.update({
-                'title': embed_data.get('title') or '',
-                'description': embed_data.get('description') or '',
-                'color': embed_data.get('color', discord.Color.blue().value),
-                'footer': embed_data.get('footer') or '',
-                'author': embed_data.get('author') or '',
-                'image_url': embed_data.get('image_url') or '',
-                'thumbnail_url': embed_data.get('thumbnail_url') or '',
-                'mention_message': embed_data.get('mention_message') or '@tag'
-            })
-            
-            await interaction.response.defer()
-            await self.embed_view.update_embed(interaction)
-            await interaction.followup.send(
-                "✅ Embed imported successfully!",
-                ephemeral=True
-            )
-            
-        except json.JSONDecodeError:
-            await interaction.response.send_message(
-                "❌ Invalid embed code format. Please make sure you copied the entire code correctly.",
-                ephemeral=True
-            )
-        except Exception as e:
-            print(f"Error importing embed: {e}")
-            try:
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(
-                        "❌ An error occurred while importing the embed.",
-                        ephemeral=True
-                    )
-                else:
-                    await interaction.followup.send(
-                        "❌ An error occurred while importing the embed.",
-                        ephemeral=True
-                    )
-            except:
-                pass
-
 async def setup(bot):
-    await bot.add_cog(BearTrap(bot)) 
+    await bot.add_cog(BearTrap(bot))
