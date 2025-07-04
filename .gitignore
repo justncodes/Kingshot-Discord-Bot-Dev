@@ -1,2 +1,7 @@
-V1oldbot/
-V2Old/
+*
+!cogs/*
+!.gitignore
+!LICENSE
+!main.py
+!README.md
+!requirements.txt

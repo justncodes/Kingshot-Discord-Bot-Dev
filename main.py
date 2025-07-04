@@ -6,50 +6,36 @@ import os
 import subprocess
 
 def check_and_install_requirements():
-    required_packages = {
-        'discord.py': 'discord.py',
-        'colorama': 'colorama', 
-        'requests': 'requests',
-        'aiohttp': 'aiohttp',
-        'python-dotenv': 'python-dotenv',
-        'aiohttp-socks': 'aiohttp-socks',
-        'pytz': 'pytz',
-        'pyzipper': 'pyzipper'
-    }
+    """Check requirements and install missing ones from requirements.txt"""
     
-    def install_package(package_name):
+    # Test imports for required packages
+    required_imports = ['discord', 'colorama', 'requests', 'aiohttp', 'dotenv', 'aiohttp_socks', 'pytz', 'pyzipper']
+    
+    missing_packages = []
+    
+    for import_name in required_imports:
         try:
-            print(f"Installing {package_name}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
-            print(f"{package_name} installed successfully.")
+            __import__(import_name)
+        except ImportError:
+            missing_packages.append(import_name)
+    
+    if missing_packages:
+        print(f"Missing packages detected: {', '.join(missing_packages)}")
+        print("Installing from requirements.txt...")
+        
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "-r", "requirements.txt"
+            ], timeout=300, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print("✓ All packages installed successfully!")
             return True
-        except subprocess.CalledProcessError:
-            print(f"Error installing {package_name}.")
-            return False
-
-    packages_to_install = []
-    try:
-        import pkg_resources
-        installed_packages = {pkg.key for pkg in pkg_resources.working_set}
-    except ImportError:
-        install_package('setuptools')
-        import pkg_resources
-        installed_packages = {pkg.key for pkg in pkg_resources.working_set}
-
-    for package, pip_name in required_packages.items():
-        if package.lower() not in installed_packages:
-            packages_to_install.append(pip_name)
-
-    if packages_to_install:
-        print("Missing libraries detected. Starting installation...")
-        for package in packages_to_install:
-            success = install_package(package)
-            if not success:
-                print(f"Some libraries could not be installed. Please run pip install {package} manually.")
-                sys.exit(1)
-        print("All required libraries installed!")
-        return True
-    return False
+        except Exception as e:
+            print(f"✗ Failed to install from requirements.txt: {e}")
+            print("Please install manually: pip install -r requirements.txt")
+            sys.exit(1)
+    else:
+        print("✓ All required packages already installed")
+        return False
 
 if __name__ == "__main__":
     check_and_install_requirements()
@@ -65,41 +51,22 @@ if __name__ == "__main__":
     import zipfile
     from datetime import datetime
 
-    # Migration function to detect old system and migrate to new
+    # Migration function to detect old system and migrate to new if no version file exists
     def is_legacy_version():
         """Check if this is the old autoupdateinfo.txt based system"""
-        return os.path.exists("autoupdateinfo.txt") and not os.path.exists("version")
+        return not os.path.exists("version")
 
     def migrate_from_legacy():
         """Migrate from old system to new GitHub release system"""
         print(Fore.YELLOW + "Detected legacy update system. Migrating to new GitHub release system..." + Style.RESET_ALL)
         
-        # Create version file - start with a reasonable version
-        # Try to extract version from autoupdateinfo.txt if available
-        current_version = "v1.1.0"  # Default fallback
-        if os.path.exists("autoupdateinfo.txt"):
-            try:
-                with open("autoupdateinfo.txt", "r") as f:
-                    for line in f:
-                        if line.startswith("Version="):
-                            old_version = line.split("=")[1].strip()
-                            # Convert old format (V1.1) to new format (v1.1.0)
-                            if old_version.startswith("V"):
-                                old_version = old_version[1:] # Remove V
-                            if old_version.count(".") == 0:
-                                current_version = f"v{old_version}.0"
-                            elif old_version.count(".") == 1:
-                                current_version = f"v{old_version}.0"
-                            else:
-                                current_version = f"v{old_version}"
-                            break
-            except Exception as e:
-                print(f"Warning: Could not parse version from autoupdateinfo.txt: {e}")
+        current_version = "v1.0.0"
         
+        # Create the new version file first
         with open("version", "w") as f:
             f.write(current_version)
         
-        # Clean up old files
+        # Clean up old autoupdateinfo file
         if os.path.exists("autoupdateinfo.txt"):
             try:
                 os.remove("autoupdateinfo.txt")
@@ -291,10 +258,10 @@ if __name__ == "__main__":
                                     print(Fore.RED + f"ERROR: Could not install new main.py: {e}" + Style.RESET_ALL)
                                     return
                             
-                            # Copy all other files
+                            # Copy other files
                             for root, _, files in os.walk(update_dir):
                                 for file in files:
-                                    if file == "main.py":  # Already handled
+                                    if file == "main.py":
                                         continue
                                         
                                     src_path = os.path.join(root, file)
@@ -302,18 +269,33 @@ if __name__ == "__main__":
                                     dst_path = os.path.join(".", rel_path)
                                     
                                     # Skip certain files that shouldn't be overwritten
-                                    if file in ["bot_token.txt", "version"] or dst_path.startswith("db/") or dst_path.startswith("db\\"):
+                                    if file in ["bot_token.txt", "version", "autoupdateinfo.txt"] or dst_path.startswith("db/") or dst_path.startswith("db\\"):
                                         continue
                                     
                                     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
-                                    if os.path.exists(dst_path):
+                                    # Only backup important files
+                                    should_backup = any([
+                                        dst_path.startswith("cogs/"),
+                                        file.endswith(".py")
+                                    ])
+                                    
+                                    # Skip backing up standard project files
+                                    if file in ["README.md", "requirements.txt"]:
+                                        should_backup = False
+                                    
+                                    if os.path.exists(dst_path) and should_backup:
                                         backup_path = f"{dst_path}.bak"
                                         safe_remove_file(backup_path)
                                         try:
                                             os.rename(dst_path, backup_path)
                                         except Exception as e:
                                             print(Fore.YELLOW + f"Could not create backup of {dst_path}: {e}" + Style.RESET_ALL)
+                                    elif os.path.exists(dst_path): # For standard files, just overwrite without backup
+                                        try:
+                                            os.remove(dst_path)
+                                        except Exception:
+                                            pass
                                             
                                     try:
                                         shutil.copy2(src_path, dst_path)
