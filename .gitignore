@@ -7,3 +7,4 @@
 !autoupdateinfo.txt
 !cogs/
 !cogs/*.py
+!.gitlab-ci.yml

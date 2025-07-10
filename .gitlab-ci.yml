@@ -1,0 +1,30 @@
+# .gitlab-ci.yml
+
+sync_from_github:
+  stage: deploy
+  image: alpine/git:latest
+
+  tags:
+    - docker
+
+  variables:
+    GITHUB_REPO_URL: "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git"
+
+  script:
+    - echo "Starting sync from GitHub..."
+
+    # Clone the source repository from GitHub as a mirror.
+    - git clone --mirror $GITHUB_REPO_URL .
+
+    # Set the push URL to the current GitLab project.
+    - git remote set-url --push origin "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
+
+    # Push the mirror to the GitLab repository.
+    - echo "Pushing mirror to GitLab at ${CI_PROJECT_URL}..."
+    - git push --mirror origin
+
+    - echo "Sync complete."
+
+  rules:
+    # Run ONLY when triggered by a webhook.
+    - if: '$CI_PIPELINE_SOURCE == "trigger"'
