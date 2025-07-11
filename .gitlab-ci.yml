@@ -6,26 +6,27 @@ variables:
 sync_from_github:
   stage: deploy
   image:
-    name: alpine/git:latest    
-    entrypoint: [""] # Tells the runner to start a standard shell, which can then hopefully execute our script.
+    name: alpine/git:latest
+    entrypoint: [""]
 
   tags:
     - docker
 
   script:
     - echo "Starting sync from GitHub..."
-    - set -x # Keep for debugging
 
-    # Clone the source repository from GitHub as a mirror.
-    - git clone --mirror $GITHUB_REPO_URL .
+    # Add our GitHub repository as a new remote called 'github'.
+    - echo "Adding GitHub as a remote..."
+    - git remote add github $GITHUB_REPO_URL
 
-    # Set the push URL to the current GitLab project.
-    - echo "Clone complete. Setting remote..."
-    - git remote set-url --push origin "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
+    # Fetch all branches and tags from the 'github' remote.
+    # Prune any local branches that were deleted on GitHub.
+    - echo "Fetching all data from GitHub..."
+    - git fetch --prune github
 
-    # Push the mirror to the GitLab repository.
-    - echo "Pushing mirror to GitLab at ${CI_PROJECT_URL}..."
-    - git push --mirror origin
+    # Push everything we just fetched to our GitLab repository.
+    - echo "Pushing mirror to GitLab..."
+    - git push --mirror "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
 
     - echo "Sync complete."
 
