@@ -14,9 +14,10 @@ sync_from_github:
     - echo "Starting sync from GitHub..."
 
     # Clone the source repository from GitHub as a mirror.
-    - git clone --mirror $GITHUB_REPO_URL .
+    - git clone --mirror "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git" .
 
     # Set the push URL to the current GitLab project.
+    - echo "Clone command completed. Setting remote for GitLab..."
     - git remote set-url --push origin "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
 
     # Push the mirror to the GitLab repository.
