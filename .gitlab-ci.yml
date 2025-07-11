@@ -26,7 +26,7 @@ sync_from_github:
 
     # Push everything we just fetched to our GitLab repository.
     - echo "Pushing mirror to GitLab..."
-    - git push --mirror "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
+    - git push --mirror origin
 
     - echo "Sync complete."
 
