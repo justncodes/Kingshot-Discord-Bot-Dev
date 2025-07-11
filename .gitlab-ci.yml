@@ -17,7 +17,7 @@ sync_from_github:
     - echo "Fetching all data from GitHub..."
     - git fetch --prune github
     - echo "Pushing mirror to GitLab using Project Access Token..."
-    - git push --prune "https://gitlab-ci:${GITLAB_PUSH_TOKEN}@${CI_PROJECT_URL#https://}" --tags 'refs/remotes/github/*:refs/heads/*' '^refs/remotes/github/HEAD'
+    - git push --force --prune "https://gitlab-ci:${GITLAB_PUSH_TOKEN}@${CI_PROJECT_URL#https://}" --tags 'refs/remotes/github/*:refs/heads/*' '^refs/remotes/github/HEAD'
     - echo "Sync complete."
 
   rules:
