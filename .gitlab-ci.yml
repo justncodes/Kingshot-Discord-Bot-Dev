@@ -1,7 +1,8 @@
 # .gitlab-ci.yml
 
 variables:
-  GITHUB_REPO_URL: "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git"
+  # Starts the job in a clean, empty directory.
+  GIT_STRATEGY: none
 
 sync_from_github:
   stage: deploy
@@ -12,12 +13,10 @@ sync_from_github:
     - docker
 
   script:
-    - echo "Adding GitHub as a remote..."
-    - git remote add github $GITHUB_REPO_URL
-    - echo "Fetching all data from GitHub..."
-    - git fetch --prune github
-    - echo "Pushing mirror to GitLab using Project Access Token..."
-    - git push --force --prune "https://gitlab-ci:${GITLAB_PUSH_TOKEN}@${CI_PROJECT_URL#https://}" --tags 'refs/remotes/github/*:refs/heads/*' '^refs/remotes/github/HEAD'
+    - echo "Starting clean-room sync..."
+    - set -x
+    - git clone --mirror "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git" .
+    - git push --mirror "https://gitlab-ci:${GITLAB_PUSH_TOKEN}@${CI_PROJECT_URL#https://}"
     - echo "Sync complete."
 
   rules:
