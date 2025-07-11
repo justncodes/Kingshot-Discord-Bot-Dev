@@ -8,28 +8,17 @@ sync_from_github:
   image:
     name: alpine/git:latest
     entrypoint: [""]
-
   tags:
     - docker
 
   script:
-    - echo "Starting sync from GitHub..."
-
-    # Add our GitHub repository as a new remote called 'github'.
     - echo "Adding GitHub as a remote..."
     - git remote add github $GITHUB_REPO_URL
-
-    # Fetch all branches and tags from the 'github' remote.
-    # Prune any local branches that were deleted on GitHub.
     - echo "Fetching all data from GitHub..."
     - git fetch --prune github
-
-    # Push everything we just fetched to our GitLab repository.
-    - echo "Pushing mirror to GitLab..."
-    - git push --mirror "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
-
+    - echo "Pushing mirror to GitLab using Project Access Token..."
+    - git push --mirror "https://gitlab-ci:${GITLAB_PUSH_TOKEN}@${CI_PROJECT_URL#https://}"
     - echo "Sync complete."
 
   rules:
-    # Run ONLY when triggered by a webhook.
     - if: '$CI_PIPELINE_SOURCE == "trigger"'
