@@ -1,14 +1,14 @@
 # .gitlab-ci.yml
 
+variables:
+  GITHUB_REPO_URL: "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git"
+
 sync_from_github:
   stage: deploy
   image: alpine/git:latest
 
   tags:
     - docker
-
-  variables:
-    GITHUB_REPO_URL: "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git"
 
   script:
     - echo "Starting sync from GitHub..."
