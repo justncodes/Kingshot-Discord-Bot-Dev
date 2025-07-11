@@ -1,9 +1,6 @@
 # .gitlab-ci.yml
 
-variables:
-  GITHUB_REPO_URL: "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git"
-
-sync_from_github:
+sync_from_github_debug_v2:
   stage: deploy
   image: alpine/git:latest
 
@@ -11,20 +8,23 @@ sync_from_github:
     - docker
 
   script:
-    - echo "Starting sync from GitHub..."
+    # The '|' tells YAML to treat the following indented block as a single string.
+    # 'set -ex' prints each command before running it (for debugging) and exits on any error.
+    - |
+      set -ex
 
-    # Clone the source repository from GitHub as a mirror.
-    - git clone --mirror "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git" .
+      echo "--- Starting sync from GitHub (DEBUG) ---"
 
-    # Set the push URL to the current GitLab project.
-    - echo "Clone command completed. Setting remote for GitLab..."
-    - git remote set-url --push origin "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
+      # We are using the hardcoded URL to ensure there are no variable expansion issues.
+      git clone --mirror "https://github.com/justncodes/Kingshot-Discord-Bot-Dev.git" .
 
-    # Push the mirror to the GitLab repository.
-    - echo "Pushing mirror to GitLab at ${CI_PROJECT_URL}..."
-    - git push --mirror origin
+      echo "--- Clone command completed. Setting remote for GitLab... ---"
+      git remote set-url --push origin "https://${CI_REGISTRY_USER}:${CI_JOB_TOKEN}@${CI_PROJECT_URL#https://}.git"
 
-    - echo "Sync complete."
+      echo "--- Pushing mirror to GitLab at ${CI_PROJECT_URL} ---"
+      git push --mirror origin
+
+      echo "--- Sync complete. ---"
 
   rules:
     # Run ONLY when triggered by a webhook.
